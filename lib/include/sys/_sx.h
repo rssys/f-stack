@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2010 Kip Macy All rights reserved.
+ * Copyright (c) 2013 Patrick Kelsey. All rights reserved.
  * Copyright (C) 2017-2021 THL A29 Limited, a Tencent company.
  * All rights reserved.
  *
@@ -25,43 +26,19 @@
  *
  */
 
-#ifndef _FSTACK_MACHINE_PCPU_H_
-#define _FSTACK_MACHINE_PCPU_H_
+#ifndef _FSTACK_SYS__SX_H_
+#define _FSTACK_SYS__SX_H_
 
-#include_next <machine/pcpu.h>
+#include "ff_host_interface.h"
 
-#undef __curthread
-#undef get_pcpu
-#undef PCPU_GET
-#undef PCPU_ADD
-#undef PCPU_INC
-#undef PCPU_PTR
-#undef PCPU_SET
+struct sx {
+    struct lock_object lock_object;
+    ff_rwlock_t sx_lock;
+};
 
-extern __thread struct thread *pcurthread;
-extern __thread struct pcpu *pcpup;
-extern struct pcpu *pallcpup;
+struct sx_padalign {
+    struct lock_object lock_object;
+    ff_rwlock_t sx_lock;
+} __aligned(CACHE_LINE_SIZE);
 
-#define	get_pcpu()              (pcpup->pc_ ## prvspace)
-
-#define PCPU_GET(member)         (pcpup->pc_ ## member)
-#define PCPU_ADD(member, val)    (pcpup->pc_ ## member += (val))
-#define PCPU_INC(member)         PCPU_ADD(member, 1)
-#define PCPU_PTR(member)         (&pcpup->pc_ ## member)
-#define PCPU_SET(member, val)    (pcpup->pc_ ## member = (val))
-
-static __inline struct thread *
-__curthread_ff(void)
-{
-    return (pcurthread);
-}
-
-#ifndef __curthread
-#define __curthread __curthread_ff
-#endif
-
-#ifndef curthread
-#define curthread __curthread_ff()
-#endif
-
-#endif    /* _FSTACK_MACHINE_PCPU_H_ */
+#endif    /* _FSTACK_SYS__SX_H_ */

@@ -54,6 +54,8 @@
 #include <rte_udp.h>
 #include <rte_eth_bond.h>
 #include <rte_eth_bond_8023ad.h>
+#include <rte_spinlock.h>
+#include <rte_ring_elem.h>
 
 #include "ff_dpdk_if.h"
 #include "ff_dpdk_pcap.h"
@@ -73,6 +75,9 @@ int enable_kni;
 static int kni_accept;
 static int knictl_action = FF_KNICTL_ACTION_DEFAULT;
 #endif
+
+#define TX_RING_COUNT 64
+#define TX_RING_DEQUEUE_SIZE TX_RING_COUNT
 
 static int numa_on;
 
@@ -293,11 +298,22 @@ init_lcore_conf(void)
         }
 
         lcore_conf.nb_queue_list[port_id] = pconf->nb_lcores;
+        lcore_conf.tx_rings[j] =
+            rte_ring_create("tx ring",
+                            TX_RING_COUNT, socket_id,
+                            RING_F_MP_HTS_ENQ | RING_F_MC_HTS_DEQ);
+        if (!lcore_conf.tx_rings[j]) {
+            rte_exit(EXIT_FAILURE, "failed to initialize ring buffer for port %d\n", j);
+        }
     }
 
     if (lcore_conf.nb_rx_queue == 0) {
         rte_exit(EXIT_FAILURE, "lcore %u has nothing to do\n", lcore_id);
     }
+
+    rte_spinlock_recursive_init(&lcore_conf.lock);
+    rte_spinlock_init(&lcore_conf.tx_lock);
+    //rte_spinlock_init(&lcore_conf.tx_mbufs_lock);
 
     return 0;
 }
@@ -710,6 +726,14 @@ init_port_start(void)
                 }
             } else {
                 printf("TSO is disabled\n");
+            }
+
+            if (dev_info.tx_offload_capa & DEV_TX_OFFLOAD_MT_LOCKFREE) {
+                printf("MT Lockfree TX is supported\n");
+                port_conf.txmode.offloads |= DEV_TX_OFFLOAD_MT_LOCKFREE;
+                pconf->hw_features.tx_lockfree = 1;
+            } else {
+                printf("MT Lockfree TX is not supported\n");
             }
 
             if (dev_info.reta_size) {
@@ -1277,7 +1301,9 @@ ff_veth_input(const struct ff_dpdk_if_context *ctx, struct rte_mbuf *pkt)
         prev = mb;
     }
 
+    //rte_spinlock_recursive_unlock(&lcore_conf.lock);
     ff_veth_process_packet(ctx->ifp, hdr);
+    //rte_spinlock_recursive_lock(&lcore_conf.lock);
 }
 
 static enum FilterReturn
@@ -1762,14 +1788,14 @@ process_msg_ring(uint16_t proc_id, struct rte_mbuf **pkts_burst)
 
 /* Send burst of packets on an output interface */
 static inline int
-send_burst(struct lcore_conf *qconf, uint16_t n, uint8_t port)
+send_burst(struct lcore_conf *qconf, struct rte_mbuf **m_table, uint16_t n, uint8_t port)
 {
-    struct rte_mbuf **m_table;
+    //struct rte_mbuf **m_table;
     int ret;
     uint16_t queueid;
 
     queueid = qconf->tx_queue_id[port];
-    m_table = (struct rte_mbuf **)qconf->tx_mbufs[port].m_table;
+    //m_table = (struct rte_mbuf **)qconf->tx_mbufs[port].m_table;
 
     if (unlikely(ff_global_cfg.pcap.enable)) {
         uint16_t i;
@@ -1801,25 +1827,82 @@ send_burst(struct lcore_conf *qconf, uint16_t n, uint8_t port)
     return 0;
 }
 
+//static inline int
+//send_burst_if_greater(struct lcore_conf *qconf, uint16_t min, uint8_t port, bool locked) {
+//    struct rte_mbuf *mbufs[MAX_PKT_BURST];
+//    uint16_t len;
+//    if (!locked) {
+//        rte_spinlock_lock(&qconf->tx_mbufs_lock);
+//    }
+//    if (qconf->tx_mbufs[port].len < min) {
+//        rte_spinlock_unlock(&qconf->tx_mbufs_lock);
+//        return 0;
+//    }
+//    len = qconf->tx_mbufs[port].len;
+//    memcpy(mbufs, qconf->tx_mbufs[port].m_table, len * sizeof(struct rte_mbuf *));
+//    qconf->tx_mbufs[port].len = 0;
+//    rte_spinlock_unlock(&qconf->tx_mbufs_lock);
+//    rte_spinlock_lock(&qconf->tx_lock);
+//    send_burst(qconf, mbufs, len, port);
+//    rte_spinlock_unlock(&qconf->tx_lock);
+//    return 1;
+//}
+
+static unsigned int
+send_burst_from_ring(struct lcore_conf *qconf, uint8_t port, unsigned int dequeue_size)
+{
+    unsigned int n, m, k, i;
+    struct rte_ring *ring = qconf->tx_rings[port];
+    struct rte_ring_zc_data zcd;
+    uint16_t queueid = qconf->tx_queue_id[port];
+    int lockfree = qconf->port_cfgs[port].hw_features.tx_lockfree;
+
+    n = rte_ring_dequeue_zc_burst_start(
+        ring, dequeue_size, &zcd, NULL);
+    if (n > 0) {
+        if (!lockfree) {
+            rte_spinlock_lock(&qconf->tx_lock);
+        }
+        struct rte_mbuf **buf1 = zcd.ptr1;
+        m = rte_eth_tx_burst(port, queueid, buf1, zcd.n1);
+        ff_traffic.tx_packets += m;
+        for (i = 0; i < m; i++) {
+            ff_traffic.tx_bytes += rte_pktmbuf_pkt_len(buf1[i]);
+        }
+        if (m == zcd.n1 && n != zcd.n1) {
+            struct rte_mbuf **buf2 = zcd.ptr2;
+            k = rte_eth_tx_burst(port, queueid, buf2, n - zcd.n1);
+            m += k;
+            for (i = 0; i < k; i++) {
+                ff_traffic.tx_bytes += rte_pktmbuf_pkt_len(buf2[i]);
+            }
+        }
+        if (!lockfree) {
+            rte_spinlock_unlock(&qconf->tx_lock);
+        }
+        rte_ring_dequeue_zc_finish(ring, m);
+    } else {
+        m = 0;
+    }
+    return m;
+}
+
 /* Enqueue a single packet, and send burst if queue is filled */
 static inline int
 send_single_packet(struct rte_mbuf *m, uint8_t port)
 {
     uint16_t len;
     struct lcore_conf *qconf;
+    struct rte_ring *ring;
 
     qconf = &lcore_conf;
-    len = qconf->tx_mbufs[port].len;
-    qconf->tx_mbufs[port].m_table[len] = m;
-    len++;
-
-    /* enough pkts to be sent */
-    if (unlikely(len == MAX_PKT_BURST)) {
-        send_burst(qconf, MAX_PKT_BURST, port);
-        len = 0;
+    ring = qconf->tx_rings[port];
+#ifdef CONFIG_ENABLE_TIME_TRACE
+    pegasus_trace_time(8);
+#endif
+    while (rte_ring_mp_enqueue(ring, m)) {
+        send_burst_from_ring(qconf, port, TX_RING_DEQUEUE_SIZE);
     }
-
-    qconf->tx_mbufs[port].len = len;
     return 0;
 }
 
@@ -1829,6 +1912,7 @@ ff_dpdk_if_send(struct ff_dpdk_if_context *ctx, void *m,
 {
 #ifdef FF_USE_PAGE_ARRAY
     struct lcore_conf *qconf = &lcore_conf;
+    rte_spinlock_recursive_lock(&qconf->lock);
     int    len = 0;
 
     len = ff_if_send_onepkt(ctx, m,total);
@@ -1837,8 +1921,10 @@ ff_dpdk_if_send(struct ff_dpdk_if_context *ctx, void *m,
         len = 0;
     }
     qconf->tx_mbufs[ctx->port_id].len = len;
+    rte_spinlock_recursive_unlock(&qconf->lock);
     return 0;
 #endif
+    int res;
     struct rte_mempool *mbuf_pool = pktmbuf_pool[lcore_conf.socket_id];
     struct rte_mbuf *head = rte_pktmbuf_alloc(mbuf_pool);
     if (head == NULL) {
@@ -1948,8 +2034,13 @@ ff_dpdk_if_send(struct ff_dpdk_if_context *ctx, void *m,
 
     ff_mbuf_free(m);
 
-    return send_single_packet(head, ctx->port_id);
+    //rte_spinlock_recursive_lock(&lcore_conf.lock);
+    res = send_single_packet(head, ctx->port_id);
+    //rte_spinlock_recursive_unlock(&lcore_conf.lock);
+    return res;
 }
+
+extern void pegasus_trace_time(int tag);
 
 static int
 main_loop(void *arg)
@@ -1990,16 +2081,21 @@ main_loop(void *arg)
         diff_tsc = cur_tsc - prev_tsc;
         if (unlikely(diff_tsc >= drain_tsc)) {
             for (i = 0; i < qconf->nb_tx_port; i++) {
+                //port_id = qconf->tx_port_id[i];
+                //if (qconf->tx_mbufs[port_id].len == 0)
+                //    continue;
+                //idle = 0;
+                //send_burst(qconf,
+                //    qconf->tx_mbufs[port_id].len,
+                //    port_id);
+                //qconf->tx_mbufs[port_id].len = 0;
                 port_id = qconf->tx_port_id[i];
-                if (qconf->tx_mbufs[port_id].len == 0)
-                    continue;
-
-                idle = 0;
-
-                send_burst(qconf,
-                    qconf->tx_mbufs[port_id].len,
-                    port_id);
-                qconf->tx_mbufs[port_id].len = 0;
+                //if (send_burst_if_greater(qconf, 1, port_id, false)) {
+                //    idle = 0;
+                //}
+                if (send_burst_from_ring(qconf, port_id, TX_RING_DEQUEUE_SIZE)) {
+                    idle = 0;
+                }
             }
 
             prev_tsc = cur_tsc;
@@ -2026,6 +2122,9 @@ main_loop(void *arg)
             if (nb_rx == 0)
                 continue;
 
+#ifdef CONFIG_ENABLE_TIME_TRACE
+            pegasus_trace_time(2);
+#endif
             idle = 0;
 
             /* Prefetch first packets */
@@ -2088,6 +2187,7 @@ int
 ff_dpdk_if_up(void) {
     int i;
     struct lcore_conf *qconf = &lcore_conf;
+
     for (i = 0; i < qconf->nb_tx_port; i++) {
         uint16_t port_id = qconf->tx_port_id[i];
 
@@ -2173,10 +2273,19 @@ ff_rss_check(void *softc, uint32_t saddr, uint32_t daddr,
     uint16_t sport, uint16_t dport)
 {
     struct lcore_conf *qconf = &lcore_conf;
-    struct ff_dpdk_if_context *ctx = ff_veth_softc_to_hostc(softc);
-    uint16_t nb_queues = qconf->nb_queue_list[ctx->port_id];
+    rte_spinlock_recursive_lock(&qconf->lock);
+    struct ff_dpdk_if_context *ctx;
+    uint16_t nb_queues;
+
+    if (!softc) {
+        return 1;
+    }
+
+    ctx = ff_veth_softc_to_hostc(softc);
+    nb_queues = qconf->nb_queue_list[ctx->port_id];
 
     if (nb_queues <= 1) {
+        rte_spinlock_recursive_unlock(&qconf->lock);
         return 1;
     }
 
@@ -2202,6 +2311,8 @@ ff_rss_check(void *softc, uint32_t saddr, uint32_t daddr,
 
     uint32_t hash = 0;
     hash = toeplitz_hash(rsskey_len, rsskey, datalen, data);
+
+    rte_spinlock_recursive_unlock(&qconf->lock);
 
     return ((hash & (reta_size - 1)) % nb_queues) == queueid;
 }

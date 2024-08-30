@@ -20,13 +20,13 @@ else
 ifeq (${MACHINE_CPUARCH},powerpc)
 _MINUS_O=	-O	# gcc miscompiles some code at -O2
 else
-_MINUS_O=	-O2
+_MINUS_O=	-O2 -g
 endif
 ifeq (${MACHINE_CPUARCH},amd64)
 ifneq (${COMPILER_TYPE},clang)
 COPTFLAGS?=-O2 -fno-strict-aliasing -frename-registers -pipe -Wno-maybe-uninitialized #-finline-functions
 else
-COPTFLAGS?=-O2 -pipe
+COPTFLAGS?=-O2 -pipe -g
 endif
 else
 COPTFLAGS?=${_MINUS_O} -pipe
@@ -61,7 +61,7 @@ CFLAGS+= --param large-function-growth=100000
 CFLAGS+= --param max-inline-insns-single=10000
 endif
 endif
-WERROR?= -Werror -Wno-unused-variable
+WERROR?= -Wno-error -Wno-unused-variable
 
 # XXX LOCORE means "don't declare C stuff" not "for locore.s".
 ASM_CFLAGS= -x assembler-with-cpp -DLOCORE ${CFLAGS} ${KERNEL_CFLAGS}

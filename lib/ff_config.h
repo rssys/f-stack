@@ -52,6 +52,7 @@ struct ff_hw_features {
     uint8_t tx_csum_ip;
     uint8_t tx_csum_l4;
     uint8_t tx_tso;
+    uint8_t tx_lockfree;
 };
 
 struct ff_port_cfg {
@@ -193,6 +194,7 @@ struct ff_config {
         int hz;
         int fd_reserve;
         int mem_size;
+        int ncpu;
     } freebsd;
 
     struct {

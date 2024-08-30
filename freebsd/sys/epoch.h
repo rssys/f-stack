@@ -70,7 +70,9 @@ void	epoch_wait(epoch_t epoch);
 void	epoch_wait_preempt(epoch_t epoch);
 void	epoch_drain_callbacks(epoch_t epoch);
 void	epoch_call(epoch_t epoch, epoch_callback_t cb, epoch_context_t ctx);
-int	in_epoch(epoch_t epoch);
+static int	in_epoch(epoch_t epoch) {
+	return 1;
+}
 int in_epoch_verbose(epoch_t epoch, int dump_onfail);
 DPCPU_DECLARE(int, epoch_cb_count);
 DPCPU_DECLARE(struct grouptask, epoch_cb_task);

@@ -29,6 +29,7 @@ endif
 HOST_OS:=$(shell uname -s)
 
 #DEBUG=-O0 -gdwarf-2 -g3 -Wno-format-truncation
+DEBUG=-O2 -gdwarf-2 -g3 -Wno-format-truncation
 
 # No DPDK KNI support on FreeBSD
 ifneq ($(TGT_OS),FreeBSD)
@@ -73,7 +74,7 @@ HOST_INCLUDES+= -I/usr/local/include/libepoll-shim
 endif
 
 ifndef DEBUG
-HOST_CFLAGS = -O2 -frename-registers  -funswitch-loops -fweb -Wno-format-truncation
+HOST_CFLAGS = -O2 -g -frename-registers  -funswitch-loops -fweb -Wno-format-truncation
 else
 HOST_CFLAGS = ${DEBUG} 
 endif

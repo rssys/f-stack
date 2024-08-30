@@ -183,8 +183,14 @@ struct mbuf *
 struct mbuf *
 	sbsndmbuf(struct sockbuf *sb, u_int off, u_int *moff);
 int	sbwait(struct sockbuf *sb);
-int	sblock(struct sockbuf *sb, int flags);
-void	sbunlock(struct sockbuf *sb);
+static inline int sblock(struct sockbuf *sb, int flags)
+{
+	//ff_rw_wlock(&sb->sb_sx.sx_lock);
+}
+static inline void sbunlock(struct sockbuf *sb)
+{
+	//ff_rw_wunlock(&sb->sb_sx.sx_lock);
+}
 void	sballoc(struct sockbuf *, struct mbuf *);
 void	sbfree(struct sockbuf *, struct mbuf *);
 void	sballoc_ktls_rx(struct sockbuf *sb, struct mbuf *m);

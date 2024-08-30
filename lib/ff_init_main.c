@@ -350,7 +350,7 @@ proc0_init(void *dummy __unused)
     vm_paddr_t pageablemem;
     int i;
 
-    GIANT_REQUIRED;
+    //GIANT_REQUIRED;
 
     p = &proc0;
     td = &thread0;

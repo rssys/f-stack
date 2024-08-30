@@ -40,6 +40,11 @@
 
 #define ff_MAP_FAILED    ((void *)-1)
 
+#define ff_MTX_SPIN      0x00000001
+#define ff_MTX_RECURSE   0x00000004
+
+#define ff_RW_RECURSE    0x1
+
 void *ff_mmap(void *addr, uint64_t len, int prot, int flags, int fd, uint64_t offset);
 int ff_munmap(void *addr, uint64_t len);
 
@@ -61,9 +66,19 @@ uint64_t ff_get_tsc_ns(void);
 void ff_get_current_time(int64_t *sec, long *nsec);
 void ff_update_current_ts(void);
 
-typedef volatile uintptr_t ff_mutex_t;
 typedef void * ff_cond_t;
-typedef void * ff_rwlock_t;
+//typedef struct {
+//    char lock[64];
+//} ff_rwlock_t;
+
+typedef struct {
+    volatile int locked;
+    int recursive;
+    int count;
+    void *owner;
+} ff_mutex_t;
+
+typedef ff_mutex_t ff_rwlock_t;
 
 void ff_arc4rand(void *ptr, unsigned int len, int reseed);
 uint32_t ff_arc4random(void);
@@ -77,6 +92,295 @@ int ff_in_pcbladdr(uint16_t family, void *faddr, uint16_t fport, void *laddr);
 
 int ff_rss_check(void *softc, uint32_t saddr, uint32_t daddr,
     uint16_t sport, uint16_t dport);
+
+static inline void ff_mtx_init_lock(ff_mutex_t *m, int flags)
+{
+    m->locked = 0;
+    m->recursive = (flags & ff_MTX_RECURSE) != 0;
+    m->count = 0;
+    m->owner = NULL;
+}
+
+static inline void ff_mtx_destroy_lock(ff_mutex_t *m)
+{}
+
+static inline void *gettp(void)
+{
+    void *tp;
+    __asm__ __volatile__ ("movq %%fs:0, %0" : "=r" (tp));
+    return tp;
+}
+
+static inline void ff_mtx_lock_(ff_mutex_t *m)
+{
+    while (1) {
+        if (!__atomic_exchange_n(&m->locked, 1, __ATOMIC_ACQUIRE)) {
+            return;
+        }
+        while (__atomic_load_n(&m->locked, __ATOMIC_RELAXED)) {
+            __builtin_ia32_pause();
+        }
+    }
+}
+
+static inline void ff_mtx_lock(ff_mutex_t *m)
+{
+    if (m->recursive) {
+        void *tp = gettp();
+        if (m->owner != tp) {
+            ff_mtx_lock_(m);
+            m->owner = tp;
+        }
+        ++m->count;
+    } else {
+        ff_mtx_lock_(m);
+    }
+}
+
+static inline void ff_mtx_lock_spin(ff_mutex_t *m)
+{
+    ff_mtx_lock(m);
+}
+
+static inline void ff_mtx_unlock_(ff_mutex_t *m)
+{
+    __atomic_store_n(&m->locked, 0, __ATOMIC_RELEASE);
+}
+
+static inline void ff_mtx_unlock(ff_mutex_t *m)
+{
+    if (m->recursive) {
+        if (--m->count == 0) {
+            m->owner = NULL;
+            ff_mtx_unlock_(m);
+        }
+    } else {
+        ff_mtx_unlock_(m);
+    }
+}
+
+static inline void ff_mtx_unlock_spin(ff_mutex_t *m)
+{
+    ff_mtx_unlock(m);
+}
+
+static inline int ff_mtx_trylock_(ff_mutex_t *m)
+{
+    return !__atomic_load_n(&m->locked, __ATOMIC_RELAXED) &&
+        !__atomic_exchange_n(&m->locked, 1, __ATOMIC_ACQUIRE);
+}
+
+static inline int ff_mtx_trylock(ff_mutex_t *m)
+{
+    if (m->recursive) {
+        void *tp = gettp();
+        if (m->owner != tp) {
+            if (ff_mtx_trylock_(m) == 0) {
+                return 0;
+            }
+            m->owner = tp;
+            ++m->count;
+            return 1;
+        }
+        return 1;
+    } else {
+        return ff_mtx_trylock_(m);
+    }
+}
+
+static inline int ff_mtx_trylock_spin(ff_mutex_t *m)
+{
+    return ff_mtx_trylock(m);
+}
+
+static inline void *ff_mtx_owner(ff_mutex_t *m)
+{
+    return m->owner;
+}
+
+static inline int ff_mtx_assert(ff_mutex_t *m, int what, const char *file, int line)
+{
+    return 1;
+}
+
+#define FF_RW_WRITER    1
+#define FF_RW_READER    2
+
+/*
+static inline void ff_rw_init_lock(ff_rwlock_t *rw, int flags)
+{
+    rw->bits = 0;
+    rw->recursive = (flags & ff_RW_RECURSE) != 0;
+    rw->count = 0;
+    rw->owner = NULL;
+}
+
+static inline void ff_rw_destroy_lock(ff_rwlock_t *rw)
+{}
+
+static inline int ff_rw_try_wlock_(ff_rwlock_t *rw)
+{
+    int expected = 0;
+    return __atomic_compare_exchange_n(&rw->bits, &expected, FF_RW_WRITER, false,
+        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+}
+
+static inline int ff_rw_try_wlock(ff_rwlock_t *rw)
+{
+    if (rw->recursive) {
+        void *tp = gettp();
+        if (rw->owner != tp) {
+            if (ff_rw_try_wlock_(rw) == 0) {
+                return 0;
+            }
+            rw->owner = tp;
+            ++rw->count;
+            return 1;
+        }
+        return 1;
+    } else {
+        return ff_rw_try_wlock_(rw);
+    }
+}
+
+static inline void ff_rw_wlock_(ff_rwlock_t *rw)
+{
+    while (!ff_rw_try_wlock_(rw));
+}
+
+static inline void ff_rw_wlock(ff_rwlock_t *rw)
+{
+    if (rw->recursive) {
+        void *tp = gettp();
+        if (rw->owner != tp) {
+            ff_rw_wlock_(rw);
+            rw->owner = tp;
+        }
+        ++rw->count;
+    } else {
+        ff_rw_wlock_(rw);
+    }
+}
+
+static inline void ff_rw_wunlock(ff_rwlock_t *rw)
+{
+    if (rw->recursive) {
+        if (--rw->count == 0) {
+            rw->owner = NULL;
+            __atomic_fetch_and(&rw->bits, ~FF_RW_WRITER, __ATOMIC_RELEASE);
+        }
+    } else {
+        __atomic_fetch_and(&rw->bits, ~FF_RW_WRITER, __ATOMIC_RELEASE);
+    }
+}
+
+static inline void ff_rw_runlock(ff_rwlock_t *rw)
+{
+    __atomic_fetch_add(&rw->bits, -FF_RW_READER, __ATOMIC_RELEASE);
+}
+
+static inline int ff_rw_try_rlock(ff_rwlock_t *rw)
+{
+    int value = __atomic_fetch_add(&rw->bits, FF_RW_READER, __ATOMIC_ACQUIRE);
+    if (value & FF_RW_WRITER) {
+        __atomic_fetch_add(&rw->bits, -FF_RW_READER, __ATOMIC_RELEASE);
+        return 0;
+    }
+    return 1;
+}
+
+static inline void ff_rw_rlock(ff_rwlock_t *rw)
+{
+    while (!ff_rw_try_rlock(rw));
+}
+
+static inline int ff_rw_try_upgrade(ff_rwlock_t *rw)
+{
+    int expected = FF_RW_READER;
+    return __atomic_compare_exchange_n(&rw->bits, &expected, FF_RW_WRITER, false,
+        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+}
+
+static inline void ff_rw_downgrade(ff_rwlock_t *rw)
+{
+    __atomic_fetch_add(&rw->bits, FF_RW_READER, __ATOMIC_ACQUIRE);
+    ff_rw_wunlock(rw);
+}
+
+static inline int ff_rw_wowned(ff_rwlock_t *rw)
+{
+    return __atomic_load_n(&rw->bits, __ATOMIC_ACQUIRE) & FF_RW_WRITER;
+}
+
+static inline int ff_rw_assert(ff_rwlock_t *rw, int what, const char *file, int line)
+{
+    return 1;
+}
+*/
+
+static inline void ff_rw_init_lock(ff_rwlock_t *rw, int flags)
+{
+    rw->locked = 0;
+    rw->recursive = (flags & ff_RW_RECURSE) != 0;
+    rw->count = 0;
+    rw->owner = NULL;
+}
+
+static inline void ff_rw_destroy_lock(ff_rwlock_t *rw)
+{}
+
+static inline int ff_rw_try_wlock(ff_rwlock_t *rw)
+{
+    return ff_mtx_trylock(rw);
+}
+
+static inline void ff_rw_wlock(ff_rwlock_t *rw)
+{
+    ff_mtx_lock(rw);
+}
+
+static inline void ff_rw_wunlock(ff_rwlock_t *rw)
+{
+    ff_mtx_unlock(rw);
+}
+
+static inline void ff_rw_runlock(ff_rwlock_t *rw)
+{
+    ff_mtx_unlock(rw);
+}
+
+static inline int ff_rw_try_rlock(ff_rwlock_t *rw)
+{
+    return ff_mtx_trylock(rw);
+}
+
+static inline void ff_rw_rlock(ff_rwlock_t *rw)
+{
+    ff_mtx_lock(rw);
+}
+
+static inline int ff_rw_try_upgrade(ff_rwlock_t *rw)
+{
+    return 1;
+}
+
+static inline void ff_rw_downgrade(ff_rwlock_t *rw)
+{
+}
+
+static inline int ff_rw_wowned(ff_rwlock_t *rw)
+{
+    return 1;
+}
+
+static inline int ff_rw_assert(ff_rwlock_t *rw, int what, const char *file, int line)
+{
+    return 1;
+}
+
+void ff_uma_page_slab_hash_lock(void);
+void ff_uma_page_slab_hash_unlock(void);
+void ff_host_init_thread(void);
 
 #endif
 

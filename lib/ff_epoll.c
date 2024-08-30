@@ -137,10 +137,10 @@ ff_event_to_epoll(void **ev, struct kevent *kev)
 
     (*ppev)->events   = event_one;
     // Fix #124: get user data
-    if (kev->udata != NULL)
+    //if (kev->udata != NULL)
         (*ppev)->data.ptr  = kev->udata;
-    else
-        (*ppev)->data.fd = kev->ident;
+    //else
+    //    (*ppev)->data.fd = kev->ident;
     (*ppev)++;
 }
 
@@ -156,3 +156,18 @@ ff_epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout)
     return ff_kevent_do_each(epfd, NULL, 0, events, maxevents, NULL, ff_event_to_epoll);
 }
 
+int
+ff_epoll_wait_kq(void *kq, struct epoll_event *events, int maxevents, int timeout)
+{
+    return ff_kevent_do_each_kq(kq, NULL, 0, events, maxevents, NULL, ff_event_to_epoll);
+}
+
+
+int
+ff_epoll_scan_internal(void *kq, void *events, int maxevents);
+
+int
+ff_epoll_scan(void *kq, struct epoll_event *events, int maxevents)
+{
+    return ff_epoll_scan_internal(kq, events, maxevents);
+}

@@ -67,6 +67,7 @@
 
 #define LINUX_SO_DEBUG        1
 #define LINUX_SO_REUSEADDR    2
+#define LINUX_SO_TYPE         3
 #define LINUX_SO_ERROR        4
 #define LINUX_SO_DONTROUTE    5
 #define LINUX_SO_BROADCAST    6
@@ -373,6 +374,8 @@ so_opt_convert(int optname)
             return SO_ACCEPTCONN;
         case LINUX_SO_PROTOCOL:
             return SO_PROTOCOL;
+        case LINUX_SO_TYPE:
+            return SO_TYPE;
         default:
             return -1;
     }
@@ -460,24 +463,24 @@ ip_opt_convert2linux(int optname)
     }
 }
 
+bool ff_copyin(const void *uaddr, void *kaddr, size_t len);
+bool ff_copyout(const void *kaddr, void *uaddr, size_t len);
+
 static void
 freebsd2linux_cmsghdr(struct linux_msghdr *linux_msg)
 {
     struct cmsghdr *cmsg;
     cmsg = CMSG_FIRSTHDR(linux_msg);
-    struct linux_cmsghdr *linux_cmsg = (struct linux_cmsghdr*)cmsg;
+    struct linux_cmsghdr linux_cmsg;
+    ff_copyin(cmsg, &linux_cmsg, sizeof(struct linux_cmsghdr));
 
     switch (cmsg->cmsg_level) {
         case IPPROTO_IP:
-            linux_cmsg->cmsg_type = ip_opt_convert2linux(cmsg->cmsg_type);
-            break;
-        default:
-            linux_cmsg->cmsg_type = cmsg->cmsg_type;
+            linux_cmsg.cmsg_type = ip_opt_convert2linux(linux_cmsg.cmsg_type);
             break;
     }
 
-    linux_cmsg->cmsg_level = cmsg->cmsg_level;
-    linux_cmsg->cmsg_len = cmsg->cmsg_len + sizeof(struct linux_cmsghdr) - sizeof(struct cmsghdr);
+    ff_copyout(&linux_cmsg, cmsg, sizeof(struct linux_cmsghdr));
 
 }
 
@@ -707,7 +710,7 @@ ff_read(int fd, void *buf, size_t nbytes)
     auio.uio_iov = &aiov;
     auio.uio_iovcnt = 1;
     auio.uio_resid = nbytes;
-    auio.uio_segflg = UIO_SYSSPACE;
+    auio.uio_segflg = UIO_USERSPACE;
     if ((rc = kern_readv(curthread, fd, &auio)))
         goto kern_fail;
     rc = curthread->td_retval[0];
@@ -730,7 +733,7 @@ ff_readv(int fd, const struct iovec *iov, int iovcnt)
     auio.uio_iov = __DECONST(struct iovec *, iov);
     auio.uio_iovcnt = iovcnt;
     auio.uio_resid = len;
-    auio.uio_segflg = UIO_SYSSPACE;
+    auio.uio_segflg = UIO_USERSPACE;
 
     if ((rc = kern_readv(curthread, fd, &auio)))
         goto kern_fail;
@@ -759,7 +762,7 @@ ff_write(int fd, const void *buf, size_t nbytes)
     auio.uio_iov = &aiov;
     auio.uio_iovcnt = 1;
     auio.uio_resid = nbytes;
-    auio.uio_segflg = UIO_SYSSPACE;
+    auio.uio_segflg = UIO_USERSPACE;
     if ((rc = kern_writev(curthread, fd, &auio)))
         goto kern_fail;
     rc = curthread->td_retval[0];
@@ -782,7 +785,7 @@ ff_writev(int fd, const struct iovec *iov, int iovcnt)
     auio.uio_iov = __DECONST(struct iovec *, iov);
     auio.uio_iovcnt = iovcnt;
     auio.uio_resid = len;
-    auio.uio_segflg = UIO_SYSSPACE;
+    auio.uio_segflg = UIO_USERSPACE;
     if ((rc = kern_writev(curthread, fd, &auio)))
         goto kern_fail;
     rc = curthread->td_retval[0];
@@ -890,7 +893,7 @@ ff_recvfrom(int s, void *buf, size_t len, int flags,
     aiov.iov_len = len;
     msg.msg_control = 0;
     msg.msg_flags = flags;
-    if ((rc = kern_recvit(curthread, s, &msg, UIO_SYSSPACE, NULL)))
+    if ((rc = kern_recvit(curthread, s, &msg, UIO_USERSPACE, NULL)))
         goto kern_fail;
     rc = curthread->td_retval[0];
     if (fromlen != NULL)
@@ -917,7 +920,7 @@ ff_recvmsg(int s, struct msghdr *msg, int flags)
 
     msg->msg_flags = flags;
 
-    if ((rc = kern_recvit(curthread, s, msg, UIO_SYSSPACE, NULL))) {
+    if ((rc = kern_recvit(curthread, s, msg, UIO_USERSPACE, NULL))) {
         msg->msg_flags = 0;
         goto kern_fail;
     }
@@ -968,6 +971,37 @@ ff_accept(int s, struct linux_sockaddr * addr,
     socklen_t socklen = sizeof(struct sockaddr_storage);
 
     if ((rc = kern_accept(curthread, s, &pf, &socklen, &fp)))
+        goto kern_fail;
+
+    rc = curthread->td_retval[0];
+    fdrop(fp, curthread);
+
+    if (addr && pf)
+        freebsd2linux_sockaddr(addr, pf);
+
+    if (addrlen)
+        *addrlen = pf->sa_len;
+
+    if(pf != NULL)
+        free(pf, M_SONAME);
+    return (rc);
+
+kern_fail:
+    if(pf != NULL)
+        free(pf, M_SONAME);
+    ff_os_errno(rc);
+    return (-1);
+}
+
+int
+ff_accept4(int s, struct linux_sockaddr *addr, socklen_t *addrlen, int flags)
+{
+    int rc;
+    struct file *fp;
+    struct sockaddr *pf = NULL;
+    socklen_t socklen = sizeof(struct sockaddr_storage);
+
+    if ((rc = kern_accept4(curthread, s, &pf, &socklen, flags, &fp)))
         goto kern_fail;
 
     rc = curthread->td_retval[0];
@@ -1261,6 +1295,47 @@ kern_fail:
 }
 
 int
+kqueue_kevent(struct kqueue *kq, struct thread *td, int nchanges, int nevents,
+    struct kevent_copyops *k_ops, const struct timespec *timeout);
+
+int
+ff_kevent_do_each_kq(void *kq, const struct kevent *changelist, int nchanges,
+    void *eventlist, int nevents, const struct timespec *timeout,
+    void (*do_each)(void **, struct kevent *))
+{
+    int rc;
+    struct timespec ts;
+    ts.tv_sec = 0;
+    ts.tv_nsec = 0;
+
+    struct sys_kevent_args ska = {
+        kq,
+        changelist,
+        nchanges,
+        eventlist,
+        nevents,
+        &ts,
+        do_each
+    };
+
+    struct kevent_copyops k_ops = {
+        &ska,
+        kevent_copyout,
+        kevent_copyin
+    };
+
+    if ((rc = kqueue_kevent(kq, curthread, nchanges, nevents, &k_ops,
+            &ts)))
+        goto kern_fail;
+
+    rc = curthread->td_retval[0];
+    return (rc);
+kern_fail:
+    ff_os_errno(rc);
+    return (-1);
+}
+
+int
 ff_kevent(int kq, const struct kevent *changelist, int nchanges,
     struct kevent *eventlist, int nevents, const struct timespec *timeout)
 {
@@ -1387,6 +1462,403 @@ ff_route_ctl(enum FF_ROUTE_CTL req, enum FF_ROUTE_FLAG flag,
 
     return (rc);
 
+kern_fail:
+    ff_os_errno(rc);
+    return (-1);
+}
+
+void *
+ff_fget(int fd)
+{
+    int err;
+    struct file *fp;
+    err = fget_unlocked(curthread->td_proc->p_fd, fd, NULL, &fp);
+    if (err != 0) {
+        return NULL;
+    }
+    return fp;
+}
+
+void
+ff_fdrop(void *fp)
+{
+    fdrop(fp, curthread);
+}
+
+int 
+ff_kern_poll_fp(struct thread *td, struct file *fp, int events);
+
+int
+ff_poll_fp(void *f, int events)
+{
+    return ff_kern_poll_fp(curthread, (struct file *)f, events);
+}
+
+void
+ff_kern_set_solisten_upcall(struct file *fp, int (*upcall)(void *, void *, int), void *arg);
+
+void
+ff_set_solisten_upcall(void *f, int (*upcall)(void *, void *, int), void *arg)
+{
+    ff_kern_set_solisten_upcall((struct file *)f, upcall, arg);
+}
+
+void
+ff_kern_set_so_upcall(struct file *fp, bool is_rcv, int (*upcall)(void *, void *, int), void *arg);
+
+void
+ff_set_so_upcall(void *f, int is_rcv, int (*upcall)(void *, void *, int), void *arg)
+{
+    ff_kern_set_so_upcall((struct file *)f, is_rcv, upcall, arg);
+}
+
+void *
+ff_kern_get_file_data(struct file *fp);
+
+void *
+ff_get_file_data(void *f)
+{
+    return ff_kern_get_file_data((struct file *)f);
+}
+
+void *
+ff_kern_kqueue_acquire(struct file *fp);
+
+void *
+ff_kqueue_acquire(void *fp)
+{
+    return ff_kern_kqueue_acquire((struct file *)fp);
+}
+
+void
+ff_kern_kqueue_release(struct kqueue *kq);
+
+void
+ff_kqueue_release(void *kq)
+{
+    ff_kern_kqueue_release((struct kqueue *)kq);
+}
+
+int
+ff_kern_kqueue_poll(struct kqueue *kq);
+
+int
+ff_kqueue_poll(void *kq)
+{
+    return ff_kern_kqueue_poll((struct kqueue *)kq);
+}
+
+int
+ff_kern_read_fast_path(struct thread *td, struct file *fp, struct ff_suio *auio);
+
+
+ssize_t
+ff_read_fast_path(void *fp, void *buf, size_t nbytes)
+{
+    struct ff_suio auio;
+    int rc;
+
+    if (nbytes > INT_MAX) {
+        rc = EINVAL;
+        goto kern_fail;
+    }
+
+    auio.base = (void *)buf;
+    auio.len = nbytes;
+    auio.uio_resid = nbytes;
+    if ((rc = ff_kern_read_fast_path(curthread, (struct file *)fp, &auio)))
+        goto kern_fail;
+    rc = curthread->td_retval[0];
+
+    return (rc);
+kern_fail:
+    ff_os_errno(rc);
+    return (-1);
+}
+
+int
+ff_kern_readv_fp(struct thread *td, int fd, struct file *fp, struct uio *auio);
+
+ssize_t
+ff_read_fp(int fd, void *fp, void *buf, size_t nbytes)
+{
+    struct uio auio;
+    struct iovec aiov;
+    int rc;
+
+    if (nbytes > INT_MAX) {
+        rc = EINVAL;
+        goto kern_fail;
+    }
+
+    aiov.iov_base = buf;
+    aiov.iov_len = nbytes;
+    auio.uio_iov = &aiov;
+    auio.uio_iovcnt = 1;
+    auio.uio_resid = nbytes;
+    auio.uio_segflg = UIO_USERSPACE;
+    if ((rc = ff_kern_readv_fp(curthread, fd, (struct file *)fp, &auio)))
+        goto kern_fail;
+    rc = curthread->td_retval[0];
+
+    return (rc);
+kern_fail:
+    ff_os_errno(rc);
+    return (-1);
+}
+
+ssize_t
+ff_readv_fp(int fd, void *fp, const struct iovec *iov, int iovcnt)
+{
+    struct uio auio;
+    int rc, len, i;
+
+    len = 0;
+    for (i = 0; i < iovcnt; i++)
+        len += iov[i].iov_len;
+    auio.uio_iov = __DECONST(struct iovec *, iov);
+    auio.uio_iovcnt = iovcnt;
+    auio.uio_resid = len;
+    auio.uio_segflg = UIO_USERSPACE;
+
+    if ((rc = ff_kern_readv_fp(curthread, fd, (struct file *)fp, &auio)))
+        goto kern_fail;
+    rc = curthread->td_retval[0];
+
+    return (rc);
+kern_fail:
+    ff_os_errno(rc);
+    return (-1);
+}
+
+int
+ff_kern_write_fast_path(struct thread *td, struct file *fp, struct ff_suio *auio);
+
+ssize_t
+ff_write_fast_path(void *fp, const void *buf, size_t nbytes)
+{
+    struct ff_suio auio;
+    int rc;
+
+    if (nbytes > INT_MAX) {
+        rc = EINVAL;
+        goto kern_fail;
+    }
+
+
+    auio.base = (void *)buf;
+    auio.len = nbytes;
+    auio.uio_resid = nbytes;
+    if ((rc = ff_kern_write_fast_path(curthread, (struct file *)fp, &auio)))
+        goto kern_fail;
+    rc = curthread->td_retval[0];
+
+    return (rc);
+kern_fail:
+    ff_os_errno(rc);
+    return (-1);
+}
+
+int
+ff_kern_writev_fp(struct thread *td, int fd, struct file *fp, struct uio *auio);
+
+ssize_t
+ff_write_fp(int fd, void *fp, const void *buf, size_t nbytes)
+{
+    struct uio auio;
+    struct iovec aiov;
+    int rc;
+
+    if (nbytes > INT_MAX) {
+        rc = EINVAL;
+        goto kern_fail;
+    }
+
+    aiov.iov_base = (void *)(uintptr_t)buf;
+    aiov.iov_len = nbytes;
+    auio.uio_iov = &aiov;
+    auio.uio_iovcnt = 1;
+    auio.uio_resid = nbytes;
+    auio.uio_segflg = UIO_USERSPACE;
+    if ((rc = ff_kern_writev_fp(curthread, fd, (struct file *)fp, &auio)))
+        goto kern_fail;
+    rc = curthread->td_retval[0];
+
+    return (rc);
+kern_fail:
+    ff_os_errno(rc);
+    return (-1);
+}
+
+ssize_t
+ff_writev_fp(int fd, void *fp, const struct iovec *iov, int iovcnt)
+{
+    struct uio auio;
+    int i, rc, len;
+
+    len = 0;
+    for (i = 0; i < iovcnt; i++)
+        len += iov[i].iov_len;
+    auio.uio_iov = __DECONST(struct iovec *, iov);
+    auio.uio_iovcnt = iovcnt;
+    auio.uio_resid = len;
+    auio.uio_segflg = UIO_USERSPACE;
+    if ((rc = ff_kern_writev_fp(curthread, fd, (struct file *)fp, &auio)))
+        goto kern_fail;
+    rc = curthread->td_retval[0];
+
+    return (rc);
+kern_fail:
+    ff_os_errno(rc);
+    return (-1);
+}
+
+int
+ff_sendit_fp(struct thread *td, int s, struct file *fp, struct msghdr *mp, int flags);
+
+ssize_t
+ff_sendto_fp(int s, void *fp, const void *buf, size_t len, int flags,
+             const struct linux_sockaddr *to, socklen_t tolen)
+{
+    struct msghdr msg;
+    struct iovec aiov;
+    int rc;
+
+    struct sockaddr_storage bsdaddr;
+    struct sockaddr *pf = (struct sockaddr *)&bsdaddr;
+
+    if (to) {
+        linux2freebsd_sockaddr(to, tolen, pf);
+    } else {
+        pf = NULL;
+    }
+
+    msg.msg_name = pf;
+    msg.msg_namelen = tolen;
+    msg.msg_iov = &aiov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = 0;
+    aiov.iov_base = __DECONST(void *, buf);
+    aiov.iov_len = len;
+    if ((rc = ff_sendit_fp(curthread, s, (struct file *)fp, &msg, flags)))
+        goto kern_fail;
+
+    rc = curthread->td_retval[0];
+
+    return (rc);
+kern_fail:
+    ff_os_errno(rc);
+    return (-1);
+}
+
+ssize_t
+ff_sendmsg_fp(int s, void *fp, const struct msghdr *msg, int flags)
+{
+    int rc;
+    struct sockaddr_storage freebsd_sa;
+    void *linux_sa = msg->msg_name;
+
+    if (linux_sa != NULL) {
+        linux2freebsd_sockaddr(linux_sa,
+            sizeof(struct linux_sockaddr), (struct sockaddr *)&freebsd_sa);
+        __DECONST(struct msghdr *, msg)->msg_name = &freebsd_sa;
+    }
+
+    rc = ff_sendit_fp(curthread, s, fp, __DECONST(struct msghdr *, msg), flags);
+
+    __DECONST(struct msghdr *, msg)->msg_name = linux_sa;
+
+    if (rc)
+        goto kern_fail;
+
+    rc = curthread->td_retval[0];
+
+    return (rc);
+kern_fail:
+    ff_os_errno(rc);
+    return (-1);
+}
+
+int	ff_kern_recvit_fp(struct thread *td, int s, struct file *fp, struct msghdr *mp,
+	    enum uio_seg fromseg, struct mbuf **controlp);
+
+ssize_t
+ff_recvfrom_fp(int s, void *fp, void *buf, size_t len, int flags,
+    struct linux_sockaddr *from, socklen_t *fromlen)
+{
+    struct msghdr msg;
+    struct iovec aiov;
+    int rc;
+    struct sockaddr_storage bsdaddr;
+
+    if (fromlen != NULL)
+        msg.msg_namelen = *fromlen;
+    else
+        msg.msg_namelen = 0;
+
+    msg.msg_name = &bsdaddr;
+    msg.msg_iov = &aiov;
+    msg.msg_iovlen = 1;
+    aiov.iov_base = buf;
+    aiov.iov_len = len;
+    msg.msg_control = 0;
+    msg.msg_flags = flags;
+    if ((rc = ff_kern_recvit_fp(curthread, s, (struct file *)fp, &msg, UIO_SYSSPACE, NULL)))
+        goto kern_fail;
+    rc = curthread->td_retval[0];
+    if (fromlen != NULL)
+        *fromlen = msg.msg_namelen;
+
+    if (from && msg.msg_namelen != 0)
+        freebsd2linux_sockaddr(from, (struct sockaddr *)&bsdaddr);
+
+    return (rc);
+kern_fail:
+    ff_os_errno(rc);
+    return (-1);
+}
+
+ssize_t
+ff_recvmsg_fp(int s, void *fp, struct msghdr *msg, int flags)
+{
+    int rc;
+    struct linux_msghdr *linux_msg = (struct linux_msghdr *)msg;
+
+    msg->msg_flags = flags;
+
+    if ((rc = ff_kern_recvit_fp(curthread, s, (struct file *)fp, msg, UIO_SYSSPACE, NULL))) {
+        msg->msg_flags = 0;
+        goto kern_fail;
+    }
+    rc = curthread->td_retval[0];
+
+    freebsd2linux_sockaddr(linux_msg->msg_name, msg->msg_name);
+    linux_msg->msg_flags = msg->msg_flags;
+    msg->msg_flags = 0;
+
+    if(msg->msg_control) {
+        freebsd2linux_cmsghdr(linux_msg);
+    }
+
+    return (rc);
+kern_fail:
+    ff_os_errno(rc);
+    return (-1);
+}
+
+int
+ff_kern_epoll_scan(struct kqueue *kq, struct epoll_event *events,
+    int maxevents, struct thread *td);
+
+int
+ff_epoll_scan_internal(void *kq, void *events, int maxevents)
+{
+    int rc;
+    if ((rc = ff_kern_epoll_scan(kq, events, maxevents, curthread)))
+        goto kern_fail;
+
+    rc = curthread->td_retval[0];
+    return (rc);
 kern_fail:
     ff_os_errno(rc);
     return (-1);

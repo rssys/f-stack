@@ -599,18 +599,24 @@ tvtohz(tv)
     return ((int)ticks);
 }
 
+bool ff_copyin(const void *uaddr, void *kaddr, size_t len);
+
 int
 copyin(const void *uaddr, void *kaddr, size_t len)
 {
-    memcpy(kaddr, uaddr, len);
-    return (0);
+    if (ff_copyin(uaddr, kaddr, len))
+        return (0);
+    return (EFAULT);
 }
+
+bool ff_copyout(const void *kaddr, void *uaddr, size_t len);
 
 int
 copyout(const void *kaddr, void *uaddr, size_t len)
 {
-    memcpy(uaddr, kaddr, len);
-    return (0);
+    if (ff_copyout(kaddr, uaddr, len))
+        return (0);
+    return (EFAULT);
 }
 
 #if 0
@@ -627,16 +633,14 @@ copystr(const void *kfaddr, void *kdaddr, size_t len, size_t *done)
 }
 #endif
 
+bool ff_copyinstr(const void *uaddr, void *kaddr, size_t len, size_t *done);
+
 int
 copyinstr(const void *uaddr, void *kaddr, size_t len, size_t *done)
 {    
-    size_t bytes;
-
-    bytes = strlcpy(kaddr, uaddr, len);
-    if (done != NULL)
-        *done = bytes;
-
-    return (0);
+    if (ff_copyinstr(uaddr, kaddr, len, done))
+        return (0);
+    return (EFAULT);
 }
 
 int

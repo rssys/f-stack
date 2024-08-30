@@ -41,6 +41,7 @@
 
 #include <openssl/rand.h>
 #include <rte_malloc.h>
+#include <rte_spinlock.h>
 
 #include "ff_host_interface.h"
 #include "ff_errno.h"
@@ -48,6 +49,12 @@
 static struct timespec current_ts;
 extern void* ff_mem_get_page();
 extern int ff_mem_free_addr(void* p);
+static rte_spinlock_t uma_page_slab_hash_mutex = RTE_SPINLOCK_INITIALIZER;
+
+extern __thread void *pcurthread;
+static __thread int curtid;
+
+int ff_panic_assert = 1;
 
 void *
 ff_mmap(void *addr, uint64_t len, int prot, int flags, int fd, uint64_t offset)
@@ -143,7 +150,7 @@ panic(const char *fmt, ...)
     va_list ap;
 
     va_start(ap, fmt);
-    vprintf(fmt, ap);
+    vfprintf(stderr, fmt, ap);
     va_end(ap);
 
     abort();
@@ -329,3 +336,17 @@ void ff_os_errno(int error)
 
 }
 
+void ff_uma_page_slab_hash_lock(void)
+{
+    rte_spinlock_lock(&uma_page_slab_hash_mutex);
+}
+
+void ff_uma_page_slab_hash_unlock(void)
+{
+    rte_spinlock_unlock(&uma_page_slab_hash_mutex);
+}
+
+void ff_host_init_thread(void)
+{
+    curtid = gettid();
+}

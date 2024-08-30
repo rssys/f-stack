@@ -90,6 +90,9 @@ struct lcore_conf {
     uint16_t tx_queue_id[RTE_MAX_ETHPORTS];
     struct mbuf_table tx_mbufs[RTE_MAX_ETHPORTS];
     //char *pcap[RTE_MAX_ETHPORTS];
+    struct rte_ring *tx_rings[RTE_MAX_ETHPORTS];
+    rte_spinlock_recursive_t lock;
+    rte_spinlock_t tx_lock;
 } __rte_cache_aligned;
 
 #ifdef FF_USE_PAGE_ARRAY

@@ -1737,6 +1737,59 @@ failed:
 }
 #endif
 
+struct mbuf *
+m_ffsuiotombuf(struct ff_suio *uio, int len, int align, int flags)
+{
+	struct mbuf *m, *mb;
+	int error, length;
+	ssize_t total;
+	int progress = 0;
+
+	/*
+	 * len can be zero or an arbitrary large value bound by
+	 * the total data supplied by the uio.
+	 */
+	if (len > 0)
+		total = (uio->uio_resid < len) ? uio->uio_resid : len;
+	else
+		total = uio->uio_resid;
+
+	/*
+	 * The smallest unit returned by m_getm2() is a single mbuf
+	 * with pkthdr.  We can't align past it.
+	 */
+	if (align >= MHLEN)
+		return (NULL);
+
+	/*
+	 * Give us the full allocation or nothing.
+	 * If len is zero return the smallest empty mbuf.
+	 */
+
+	m = m_getm2(NULL, max(total + align, 1), M_WAITOK, MT_DATA, flags);
+	if (m == NULL)
+		return (NULL);
+	m->m_data += align;
+
+	/* Fill all mbufs with uio data and update header information. */
+	for (mb = m; mb != NULL; mb = mb->m_next) {
+		length = min(M_TRAILINGSPACE(mb), total - progress);
+
+		error = ff_suiomovein(mtod(mb, void *), length, uio);
+		if (error) {
+			m_freem(m);
+			return (NULL);
+		}
+
+		mb->m_len = length;
+		progress += length;
+		if (flags & M_PKTHDR)
+			m->m_pkthdr.len += length;
+	}
+
+	return (m);
+}
+
 /*
  * Copy the contents of uio into a properly sized mbuf chain.
  */

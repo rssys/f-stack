@@ -1210,7 +1210,7 @@ kern_kevent(struct thread *td, int fd, int nchanges, int nevents,
 	return (error);
 }
 
-static int
+int
 kqueue_kevent(struct kqueue *kq, struct thread *td, int nchanges, int nevents,
     struct kevent_copyops *k_ops, const struct timespec *timeout)
 {
@@ -1781,6 +1781,184 @@ kqueue_task(void *arg, int pending)
 	KQ_GLOBAL_UNLOCK(&kq_global, haskqglobal);
 }
 
+struct epoll_event {
+	uint32_t events;
+	uint64_t data;
+} __attribute__ ((__packed__));
+
+int
+pegasus_fill_epvent_catch_fault(struct epoll_event *eev, uint32_t event, uint64_t data);
+
+static inline int 
+ff_kevent_to_epevent(struct epoll_event *eev, const struct kevent *kev)
+{
+	uint32_t event = 0;
+	if (kev->filter == EVFILT_READ) {
+		if (kev->data || !(kev->flags & EV_EOF))
+			event |= POLLIN;
+	} else if (kev->filter == EVFILT_WRITE)
+		event |= POLLOUT;
+	if (kev->flags & EV_ERROR)
+		event |= POLLERR;
+	if (kev->flags & EV_EOF) {
+		event |= POLLHUP;
+		if (kev->fflags)
+			event |= POLLERR;
+		if (kev->filter == EVFILT_READ)
+			event |= POLLIN;
+		else if (kev->filter == EVFILT_WRITE)
+			event |= POLLERR;
+	}
+	return pegasus_fill_epvent_catch_fault(eev, event, kev->udata);
+}
+
+int
+ff_kern_epoll_scan(struct kqueue *kq, struct epoll_event *events,
+    int maxevents, struct thread *td)
+{
+	struct kevent kev;
+	struct knote *kn, *marker;
+	struct knlist *knl;
+	int count, error, haskqglobal, influx;
+
+	count = maxevents;
+	error = 0;
+	haskqglobal = 0;
+
+	if (maxevents == 0)
+		goto done_nl;
+
+	marker = knote_alloc(M_WAITOK);
+	marker->kn_status = KN_MARKER;
+	KQ_LOCK(kq);
+
+retry:
+	if (kq->kq_count == 0) {
+		error = 0;
+		goto done;
+	}
+
+	TAILQ_INSERT_TAIL(&kq->kq_head, marker, kn_tqe);
+	influx = 0;
+	while (count) {
+		KQ_OWNED(kq);
+		kn = TAILQ_FIRST(&kq->kq_head);
+
+		if ((kn->kn_status == KN_MARKER && kn != marker) ||
+		    kn_in_flux(kn)) {
+			if (influx) {
+				influx = 0;
+				KQ_FLUX_WAKEUP(kq);
+			}
+			kq->kq_state |= KQ_FLUXWAIT;
+			error = msleep(kq, &kq->kq_lock, PSOCK,
+			    "kqflxwt", 0);
+			continue;
+		}
+
+		TAILQ_REMOVE(&kq->kq_head, kn, kn_tqe);
+		if ((kn->kn_status & KN_DISABLED) == KN_DISABLED) {
+			kn->kn_status &= ~KN_QUEUED;
+			kq->kq_count--;
+			continue;
+		}
+		if (kn == marker) {
+			KQ_FLUX_WAKEUP(kq);
+			if (count == maxevents)
+				goto retry;
+			goto done;
+		}
+		KASSERT(!kn_in_flux(kn),
+		    ("knote %p is unexpectedly in flux", kn));
+
+		if ((kn->kn_flags & EV_DROP) == EV_DROP) {
+			kn->kn_status &= ~KN_QUEUED;
+			kn_enter_flux(kn);
+			kq->kq_count--;
+			KQ_UNLOCK(kq);
+			/*
+			 * We don't need to lock the list since we've
+			 * marked it as in flux.
+			 */
+			knote_drop(kn, td);
+			KQ_LOCK(kq);
+			continue;
+		} else if ((kn->kn_flags & EV_ONESHOT) == EV_ONESHOT) {
+			kn->kn_status &= ~KN_QUEUED;
+			kn_enter_flux(kn);
+			kq->kq_count--;
+			KQ_UNLOCK(kq);
+			/*
+			 * We don't need to lock the list since we've
+			 * marked the knote as being in flux.
+			 */
+			kev = kn->kn_kevent;
+			knote_drop(kn, td);
+			KQ_LOCK(kq);
+			kn = NULL;
+		} else {
+			kn->kn_status |= KN_SCAN;
+			kn_enter_flux(kn);
+			KQ_UNLOCK(kq);
+			if ((kn->kn_status & KN_KQUEUE) == KN_KQUEUE)
+				KQ_GLOBAL_LOCK(&kq_global, haskqglobal);
+			knl = kn_list_lock(kn);
+			if (kn->kn_fop->f_event(kn, 0) == 0) {
+				KQ_LOCK(kq);
+				KQ_GLOBAL_UNLOCK(&kq_global, haskqglobal);
+				kn->kn_status &= ~(KN_QUEUED | KN_ACTIVE |
+				    KN_SCAN);
+				kn_leave_flux(kn);
+				kq->kq_count--;
+				kn_list_unlock(knl);
+				influx = 1;
+				continue;
+			}
+			kev = kn->kn_kevent;
+			KQ_LOCK(kq);
+			KQ_GLOBAL_UNLOCK(&kq_global, haskqglobal);
+			if (kn->kn_flags & (EV_CLEAR | EV_DISPATCH)) {
+				/* 
+				 * Manually clear knotes who weren't 
+				 * 'touch'ed.
+				 */
+				if (kn->kn_flags & EV_CLEAR) {
+					kn->kn_data = 0;
+					kn->kn_fflags = 0;
+				}
+				if (kn->kn_flags & EV_DISPATCH)
+					kn->kn_status |= KN_DISABLED;
+				kn->kn_status &= ~(KN_QUEUED | KN_ACTIVE);
+				kq->kq_count--;
+			} else
+				TAILQ_INSERT_TAIL(&kq->kq_head, kn, kn_tqe);
+			
+			kn->kn_status &= ~KN_SCAN;
+			kn_leave_flux(kn);
+			kn_list_unlock(knl);
+			influx = 1;
+		}
+
+		/* we are returning a copy to the user */
+		if (ff_kevent_to_epevent(events, &kev)) {
+			error = EFAULT;
+			break;
+		}
+		count--;
+		events++;
+
+	}
+	TAILQ_REMOVE(&kq->kq_head, marker, kn_tqe);
+done:
+	KQ_OWNED(kq);
+	KQ_UNLOCK_FLUX(kq);
+	knote_free(marker);
+done_nl:
+	KQ_NOTOWNED(kq);
+	td->td_retval[0] = maxevents - count;
+	return (error);
+}
+
 /*
  * Scan, update kn_data (if not ONESHOT), and copyout triggered events.
  * We treat KN_MARKER knotes as if they are in flux.
@@ -2031,6 +2209,27 @@ kqueue_ioctl(struct file *fp, u_long cmd, void *data,
 #endif
 
 	return (ENOTTY);
+}
+
+void *ff_kern_kqueue_acquire(struct file *fp)
+{
+	struct kqueue *kq;
+
+	if (kqueue_acquire(fp, &kq))
+		return NULL;
+	return kq;
+}
+
+void ff_kern_kqueue_release(struct kqueue *kq)
+{
+	kqueue_release(kq, 0);
+}
+
+int ff_kern_kqueue_poll(struct kqueue *kq)
+{
+	if (kq->kq_count)
+		return POLLIN;
+	return 0;
 }
 
 /*ARGSUSED*/

@@ -451,6 +451,7 @@ sbwait(struct sockbuf *sb)
 	    sb->sb_timeo, 0, 0));
 }
 
+/*
 int
 sblock(struct sockbuf *sb, int flags)
 {
@@ -478,6 +479,7 @@ sbunlock(struct sockbuf *sb)
 
 	sx_xunlock(&sb->sb_sx);
 }
+*/
 
 /*
  * Wakeup processes waiting on a socket buffer.  Do asynchronous notification

@@ -399,6 +399,7 @@ ff_veth_setaddr(struct ff_veth_softc *sc)
     socreate(AF_INET, &so, SOCK_DGRAM, 0, curthread->td_ucred, curthread);
     int ret = ifioctl(so, SIOCAIFADDR, (caddr_t)&req, curthread);
 
+    mtx_lock(&so->so_lock);
     sofree(so);
 
     return ret;

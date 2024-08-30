@@ -52,6 +52,7 @@ struct linux_sockaddr {
 typedef int (*loop_func_t)(void *arg);
 
 int ff_init(int argc, char * const argv[]);
+int ff_init_thread(void);
 
 void ff_run(loop_func_t loop, void *arg);
 
@@ -75,6 +76,7 @@ int ff_getsockopt(int s, int level, int optname, void *optval,
 int ff_listen(int s, int backlog);
 int ff_bind(int s, const struct linux_sockaddr *addr, socklen_t addrlen);
 int ff_accept(int s, struct linux_sockaddr *addr, socklen_t *addrlen);
+int ff_accept4(int s, struct linux_sockaddr *addr, socklen_t *addrlen, int flags);
 int ff_connect(int s, const struct linux_sockaddr *name, socklen_t namelen);
 int ff_close(int fd);
 int ff_shutdown(int s, int how);
@@ -109,6 +111,10 @@ int ff_kqueue(void);
 int ff_kevent(int kq, const struct kevent *changelist, int nchanges,
     struct kevent *eventlist, int nevents, const struct timespec *timeout);
 int ff_kevent_do_each(int kq, const struct kevent *changelist, int nchanges,
+    void *eventlist, int nevents, const struct timespec *timeout,
+    void (*do_each)(void **, struct kevent *));
+
+int ff_kevent_do_each_kq(void *kq, const struct kevent *changelist, int nchanges,
     void *eventlist, int nevents, const struct timespec *timeout,
     void (*do_each)(void **, struct kevent *));
 
@@ -298,6 +304,32 @@ int ff_zc_mbuf_write(struct ff_zc_mbuf *m, const char *data, int len);
 int ff_zc_mbuf_read(struct ff_zc_mbuf *m, const char *data, int len);
 
 /* ZERO COPY API end */
+
+/* Internal API */
+void *ff_fget(int fd);
+void ff_fdrop(void *fp);
+int ff_poll_fp(void *fp, int events);
+void ff_set_solisten_upcall(void *f, int (*upcall)(void *, void *, int), void *arg);
+void ff_set_so_upcall(void *f, int snd, int (*upcall)(void *, void *, int), void *arg);
+void *ff_get_so(void *f);
+void *ff_kqueue_acquire(void *fp);
+void ff_kqueue_release(void *kq);
+int ff_kqueue_poll(void *kq);
+ssize_t ff_read_fp(int fd, void *fp, void *buf, size_t nbytes);
+ssize_t ff_readv_fp(int fd, void *fp, const struct iovec *iov, int iovcnt);
+ssize_t ff_write_fp(int fd, void *fp, const void *buf, size_t nbytes);
+ssize_t ff_writev_fp(int fd, void *fp, const struct iovec *iov, int iovcnt);
+ssize_t ff_sendto_fp(int s, void *fp, const void *buf, size_t len, int flags,
+                     const struct linux_sockaddr *to, socklen_t tolen);
+ssize_t ff_sendmsg_fp(int s, void *fp, const struct msghdr *msg, int flags);
+ssize_t ff_recvfrom_fp(int s, void *fp, void *buf, size_t len, int flags,
+                       struct linux_sockaddr *from, socklen_t *fromlen);
+ssize_t ff_recvmsg_fp(int s, void *fp, struct msghdr *msg, int flags);
+
+ssize_t ff_read_fast_path(void *fp, void *buf, size_t nbytes);
+ssize_t ff_write_fast_path(void *fp, const void *buf, size_t nbytes);
+int ff_epoll_scan(void *kq, struct epoll_event *events, int maxevents);
+void ff_os_errno(int error);
 
 #ifdef __cplusplus
 }

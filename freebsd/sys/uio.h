@@ -98,6 +98,63 @@ int	uiomove_fromphys(struct vm_page *ma[], vm_offset_t offset, int n,
 int	uiomove_nofault(void *cp, int n, struct uio *uio);
 int	uiomove_object(struct vm_object *obj, off_t obj_size, struct uio *uio);
 
+int
+pegasus_memcpy_catch_fault(void *dst, const void *src, size_t n);
+
+struct ff_suio {
+    void *base;
+    size_t len;
+    ssize_t uio_resid;
+};
+
+static inline int
+ff_suiomovein(void *cp, int n, struct ff_suio *uio)
+{
+	size_t cnt = uio->len;
+	int error = 0;
+
+	if (cnt > n)
+		cnt = n;
+
+	if (cnt == 0)
+		goto out;
+
+	error = pegasus_memcpy_catch_fault(cp, uio->base, cnt);
+
+	if (error)
+		goto out;
+
+	uio->base = (char *)uio->base + cnt;
+	uio->len -= cnt;
+	uio->uio_resid -= cnt;
+out:
+	return (error);
+}
+
+static inline int
+ff_suiomoveout(void *cp, int n, struct ff_suio *uio)
+{
+	size_t cnt = uio->len;
+	int error = 0;
+
+	if (cnt > n)
+		cnt = n;
+
+	if (cnt == 0)
+		goto out;
+
+	error = pegasus_memcpy_catch_fault(uio->base, cp, cnt);
+
+	if (error)
+		goto out;
+
+	uio->base = (char *)uio->base + cnt;
+	uio->len -= cnt;
+	uio->uio_resid -= cnt;
+out:
+	return (error);
+}
+
 #else /* !_KERNEL */
 
 __BEGIN_DECLS

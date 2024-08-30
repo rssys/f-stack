@@ -37,6 +37,8 @@
 #include <sys/cpuset.h>
 #include <sys/sysctl.h>
 #include <sys/filedesc.h>
+#include <sys/kthread.h>
+#include <sys/unistd.h>
 
 #include <vm/uma.h>
 #include <vm/uma_int.h>
@@ -65,10 +67,13 @@ extern void uma_startup2(void);
 extern void ff_init_thread0(void);
 
 struct sx proctree_lock;
-struct pcpu *pcpup;
+__thread struct pcpu *pcpup;
+struct pcpu *pallcpup;
 struct uma_page_head *uma_page_slab_hash;
 int uma_page_mask;
 extern cpuset_t all_cpus;
+extern int mp_ncpus;
+extern u_int mp_maxid;
 
 long physmem;
 
@@ -115,6 +120,7 @@ int lo_set_defaultaddr(void)
         return ret;
 
     ret = ifioctl(so, SIOCAIFADDR, (caddr_t)&req, curthread);
+    mtx_lock(&so->so_lock);
     sofree(so);
 
     return ret;
@@ -128,6 +134,8 @@ ff_freebsd_init(void)
     char tmpbuf[32] = {0};
     void *bootmem;
     int error;
+    int ncpu;
+    int i;
 
     snprintf(tmpbuf, sizeof(tmpbuf), "%u", ff_global_cfg.freebsd.hz);
     error = kern_setenv("kern.hz", tmpbuf);
@@ -148,22 +156,29 @@ ff_freebsd_init(void)
 
     physmem = ff_global_cfg.freebsd.physmem;
 
-    pcpup = malloc(sizeof(struct pcpu), M_DEVBUF, M_ZERO);
-    pcpu_init(pcpup, 0, sizeof(struct pcpu));
-    PCPU_SET(prvspace, pcpup);
-    CPU_SET(0, &all_cpus);
+    ncpu = ff_global_cfg.freebsd.ncpu;
+    mp_ncpus = ncpu;
+    mp_maxid = ncpu - 1;
+    pallcpup = malloc(sizeof(struct pcpu) * ncpu, M_DEVBUF, M_ZERO);
+    pcpup = &pallcpup[0];
+    for (i = 0; i < ncpu; i++) {
+        pcpu_init(&pallcpup[i], i, sizeof(struct pcpu));
+        pallcpup[i].pc_prvspace = &pallcpup[i];
+        CPU_SET(i, &all_cpus);
+    }
 
     ff_init_thread0();
+    ff_host_init_thread();
+
+    num_hash_buckets = 8192;
+    uma_page_slab_hash = (struct uma_page_head *)kmem_malloc(sizeof(struct uma_page)*num_hash_buckets, M_ZERO);
+    uma_page_mask = num_hash_buckets - 1;
 
     boot_pages = 16;
     bootmem = (void *)kmem_malloc(boot_pages*PAGE_SIZE, M_ZERO);
     //uma_startup(bootmem, boot_pages);
     uma_startup1((vm_offset_t)bootmem);
     uma_startup2();
-
-    num_hash_buckets = 8192;
-    uma_page_slab_hash = (struct uma_page_head *)kmem_malloc(sizeof(struct uma_page)*num_hash_buckets, M_ZERO);
-    uma_page_mask = num_hash_buckets - 1;
 
     mutex_init();
     mi_startup();
@@ -188,4 +203,19 @@ ff_freebsd_init(void)
         printf("set loopback port default addr failed!");
 
     return (0);
+}
+
+int ff_init_thread(void)
+{
+    struct thread *newtd;
+    int res;
+    if (pcurthread)
+        return 0;
+    res = kthread_add(NULL, NULL, NULL, &newtd, RFSTOPPED, 0, "new thread");
+    if (res)
+        return res;
+    pcurthread = newtd;
+    pcpup = &pallcpup[newtd->td_tid];
+    ff_host_init_thread();
+    return 0;
 }

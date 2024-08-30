@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2010 Kip Macy All rights reserved.
+ * Copyright (c) 2013 Patrick Kelsey. All rights reserved.
  * Copyright (C) 2017-2021 THL A29 Limited, a Tencent company.
  * All rights reserved.
  *
@@ -25,43 +26,41 @@
  *
  */
 
-#ifndef _FSTACK_MACHINE_PCPU_H_
-#define _FSTACK_MACHINE_PCPU_H_
+#ifndef _FSTACK_SYS__RMLOCK_H_
+#define _FSTACK_SYS__RMLOCK_H_
 
-#include_next <machine/pcpu.h>
+#include "ff_host_interface.h"
 
-#undef __curthread
-#undef get_pcpu
-#undef PCPU_GET
-#undef PCPU_ADD
-#undef PCPU_INC
-#undef PCPU_PTR
-#undef PCPU_SET
+struct rmlock {
+    struct lock_object lock_object;
+    ff_rwlock_t rm_lock;
+};
 
-extern __thread struct thread *pcurthread;
-extern __thread struct pcpu *pcpup;
-extern struct pcpu *pallcpup;
+struct rmlock_padalign {
+    struct lock_object lock_object;
+    ff_rwlock_t rm_lock;
+} __aligned(CACHE_LINE_SIZE);
 
-#define	get_pcpu()              (pcpup->pc_ ## prvspace)
+struct rm_queue {
+	struct rm_queue	*volatile rmq_next;
+	struct rm_queue	*volatile rmq_prev;
+};
 
-#define PCPU_GET(member)         (pcpup->pc_ ## member)
-#define PCPU_ADD(member, val)    (pcpup->pc_ ## member += (val))
-#define PCPU_INC(member)         PCPU_ADD(member, 1)
-#define PCPU_PTR(member)         (&pcpup->pc_ ## member)
-#define PCPU_SET(member, val)    (pcpup->pc_ ## member = (val))
+struct rm_priotracker {
 
-static __inline struct thread *
-__curthread_ff(void)
-{
-    return (pcurthread);
-}
+};
 
-#ifndef __curthread
-#define __curthread __curthread_ff
-#endif
+#include <sys/_mutex.h>
 
-#ifndef curthread
-#define curthread __curthread_ff()
-#endif
+struct rmslock_pcpu;
 
-#endif    /* _FSTACK_MACHINE_PCPU_H_ */
+struct rmslock {
+	struct mtx mtx;
+	struct thread *owner;
+	struct rmslock_pcpu *pcpu;
+	int	writers;
+	int	readers;
+	int	debug_readers;
+};
+
+#endif    /* _FSTACK_SYS__RWLOCK_H_ */

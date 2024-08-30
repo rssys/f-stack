@@ -249,6 +249,8 @@ int	kern_readlinkat(struct thread *td, int fd, const char *path,
 int	kern_readv(struct thread *td, int fd, struct uio *auio);
 int	kern_recvit(struct thread *td, int s, struct msghdr *mp,
 	    enum uio_seg fromseg, struct mbuf **controlp);
+int	ff_kern_recvit_fp(struct thread *td, int s, struct file *fp, struct msghdr *mp,
+	    enum uio_seg fromseg, struct mbuf **controlp);
 int	kern_renameat(struct thread *td, int oldfd, const char *old, int newfd,
 	    const char *new, enum uio_seg pathseg);
 int	kern_frmdirat(struct thread *td, int dfd, const char *path, int fd,
@@ -270,6 +272,8 @@ int	kern_semctl(struct thread *td, int semid, int semnum, int cmd,
 int	kern_select(struct thread *td, int nd, fd_set *fd_in, fd_set *fd_ou,
 	    fd_set *fd_ex, struct timeval *tvp, int abi_nfdbits);
 int	kern_sendit(struct thread *td, int s, struct msghdr *mp, int flags,
+	    struct mbuf *control, enum uio_seg segflg);
+int	ff_kern_sendit_fp(struct thread *td, int s, struct file *fp, struct msghdr *mp, int flags,
 	    struct mbuf *control, enum uio_seg segflg);
 int	kern_setgroups(struct thread *td, u_int ngrp, gid_t *groups);
 int	kern_setitimer(struct thread *, u_int, struct itimerval *,

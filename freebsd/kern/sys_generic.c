@@ -292,6 +292,12 @@ kern_readv(struct thread *td, int fd, struct uio *auio)
 	return (error);
 }
 
+int
+ff_kern_readv_fp(struct thread *td, int fd, struct file *fp, struct uio *auio)
+{
+	return dofileread(td, fd, fp, auio, (off_t)-1, 0);
+}
+
 /*
  * Scatter positioned read system call.
  */
@@ -492,6 +498,12 @@ kern_writev(struct thread *td, int fd, struct uio *auio)
 	error = dofilewrite(td, fd, fp, auio, (off_t)-1, 0);
 	fdrop(fp, td);
 	return (error);
+}
+
+int
+ff_kern_writev_fp(struct thread *td, int fd, struct file *fp, struct uio *auio)
+{
+	return dofilewrite(td, fd, fp, auio, (off_t)-1, 0);
 }
 
 /*
@@ -1994,4 +2006,33 @@ kern_posix_error(struct thread *td, int error)
 	td->td_pflags |= TDP_NERRNO;
 	td->td_retval[0] = error;
 	return (0);
+}
+
+int
+ff_sopoll(struct socket *so, int events, struct ucred *active_cred,
+    struct thread *td);
+
+int 
+ff_kern_poll_fp(struct thread *td, struct file *fp, int events) {
+	struct socket *so = fp->f_data;
+	return ff_sopoll(so, events, td->td_ucred, td);
+}
+
+void
+ff_kern_set_solisten_upcall(struct file *fp, int (*upcall)(void *, void *, int), void *arg) {
+	struct socket *so = fp->f_data;
+	SOCK_LOCK(so);
+	solisten_upcall_set(so, (so_upcall_t *)(void *)upcall, arg);
+	SOCK_UNLOCK(so);
+}
+
+void
+ff_kern_set_so_upcall(struct file *fp, bool is_rcv, int (*upcall)(void *, void *, int), void *arg) {
+	struct socket *so = fp->f_data;
+	soupcall_set(so, is_rcv ? SO_RCV : SO_SND, (so_upcall_t *)(void *)upcall, arg);
+}
+
+void *
+ff_kern_get_file_data(struct file *fp) {
+	return fp->f_data;
 }

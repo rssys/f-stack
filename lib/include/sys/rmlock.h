@@ -32,25 +32,15 @@
  * $FreeBSD$
  */
 
-#ifndef _FSTACK_SYS_SX_H_
-#define _FSTACK_SYS_SX_H_
+#ifndef _FSTACK_SYS_RMLOCK_H_
+#define _FSTACK_SYS_RMLOCK_H_
 
-#include_next <sys/sx.h>
+#include_next <sys/rmlock.h>
 
-#undef sx_xlocked
-#define sx_xlocked(sx) (1)
-#define sx_try_slock_int(sx) sx_try_slock_((sx), NULL, 0)
-#define sx_try_xlock_int(sx) sx_try_xlock_((sx), NULL, 0)
-#define _sx_slock_int(sx, arg) _sx_slock((sx), (arg), NULL, 0)
-#define _sx_sunlock_int(sx) _sx_sunlock((sx), NULL, 0)
-//#define sx_assert(sx, w) ff_rw_assert(&(sx)->sx_lock, (w), __FILE__, __LINE__)
+#define	rm_wlock(rm)			_rm_wlock((rm))
+#define	rm_wunlock(rm)			_rm_wunlock((rm))
+#define	rm_rlock(rm,tracker)		((void)_rm_rlock((rm),(tracker), 0))
+#define	rm_try_rlock(rm,tracker)	_rm_rlock((rm),(tracker), 1)
+#define	rm_runlock(rm,tracker)		_rm_runlock((rm), (tracker))
 
-int ff_rw_assert(ff_rwlock_t *rw, int what, const char *file, int line);
-
-//#define sx_try_slock_int(sx) (1)
-//#define sx_try_xlock_int(sx) (1)
-
-//#define _sx_slock_int(sx, arg) (0)
-//#define _sx_sunlock_int(sx) do {} while(0)
-
-#endif    /* _FSTACK_SYS_SX_H_ */
+#endif    /* _FSTACK_SYS_RMLOCK_H_ */

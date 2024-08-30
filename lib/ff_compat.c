@@ -100,12 +100,83 @@ kproc_kthread_add(void (*start_routine)(void *), void *arg,
     return 0;
 }
 
+struct thread *
+thread_alloc(int pages)
+{
+	struct thread *td;
+	lwpid_t tid;
+    static lwpid_t curr_tid = 1;
+
+	tid = curr_tid++;
+	td = malloc(sizeof(struct thread), M_TEMP, M_NOWAIT);
+	if (!td)
+		return NULL;
+	
+	bzero(td, sizeof(struct thread));
+	td->td_tid = tid;
+	return (td);
+}
+
+struct ucred *
+crcowget(struct ucred *cr)
+{
+
+	mtx_lock(&cr->cr_mtx);
+	cr->cr_users++;
+	cr->cr_ref++;
+	mtx_unlock(&cr->cr_mtx);
+	return (cr);
+}
+
+void
+thread_cow_get_proc(struct thread *newtd, struct proc *p)
+{
+
+	PROC_LOCK_ASSERT(p, MA_OWNED);
+	newtd->td_realucred = crcowget(p->p_ucred);
+	newtd->td_ucred = newtd->td_realucred;
+	newtd->td_limit = lim_hold(p->p_limit);
+	newtd->td_cowgen = p->p_cowgen;
+}
+
 int
 kthread_add(void (*start_routine)(void *), void *arg, struct proc *p,
-    struct thread **tdp, int flags, int pages,
+    struct thread **newtdp, int flags, int pages,
     const char *str, ...)
 {
-    return 0;
+	struct thread *newtd, *oldtd;
+
+	/* If no process supplied, put it on proc0 */
+	if (p == NULL)
+		p = &proc0;
+
+	/* Initialize our new td  */
+	newtd = thread_alloc(pages);
+	if (newtd == NULL)
+		return (ENOMEM);
+
+	PROC_LOCK(p);
+	oldtd = &thread0;
+
+	bzero(&newtd->td_startzero,
+	    __rangeof(struct thread, td_startzero, td_endzero));
+	bcopy(&oldtd->td_startcopy, &newtd->td_startcopy,
+	    __rangeof(struct thread, td_startcopy, td_endcopy));
+
+	TSTHREAD(newtd, newtd->td_name);
+
+	newtd->td_proc = p;  /* needed for cpu_copy_thread */
+
+	newtd->td_pflags |= TDP_KTHREAD;
+	thread_cow_get_proc(newtd, p);
+
+	/* this code almost the same as create_thread() in kern_thr.c */
+	p->p_flag |= P_HADTHREADS;
+	PROC_UNLOCK(p);
+
+	if (newtdp)
+		*newtdp = newtd;
+	return 0;
 }
 
 void

@@ -714,6 +714,8 @@ ini_parse_handler(void* user, const char* section, const char* name,
             pconfig->freebsd.fd_reserve = atoi(value);
         } else if (strcmp(name, "memsz_MB") == 0) {
             pconfig->freebsd.mem_size = atoi(value);
+        } else if (strcmp(name, "ncpu") == 0) {
+            pconfig->freebsd.ncpu = atoi(value);
         } else {
             return freebsd_conf_handler(pconfig, "boot", name, value);
         }
@@ -783,7 +785,7 @@ dpdk_args_setup(struct ff_config *cfg)
         char* rest = cfg->dpdk.pci_whitelist;
 
         while ((token = strtok_r(rest, ",", &rest))){
-            sprintf(temp, "--pci-whitelist=%s", token);
+            sprintf(temp, "--allow=%s", token);
             dpdk_argv[n++] = strdup(temp);
         }
 
@@ -1030,6 +1032,7 @@ ff_default_config(struct ff_config *cfg)
     cfg->freebsd.physmem = 1048576*256;
     cfg->freebsd.fd_reserve = 0;
     cfg->freebsd.mem_size = 256;
+    cfg->freebsd.ncpu = 1;
 }
 
 int

@@ -40,24 +40,43 @@
 #undef _rw_runlock
 #undef _rw_try_upgrade
 #undef _rw_downgrade
+#undef rw_wlock
+#undef rw_try_wlock
+#undef rw_wunlock
+#undef rw_rlock
+#undef rw_try_rlock
+#undef rw_runlock
+#undef rw_try_upgrade
+#undef rw_downgrade
+//#undef rw_assert
 
 #define DO_NOTHING do {} while(0)
 
 void ff_rw_init_flags(struct lock_object *lo, const char *name, int opts);
+void ff_rw_destroy(struct lock_object *lo);
+void ff_rw_wlock(ff_rwlock_t *rw);
+int ff_rw_try_wlock(ff_rwlock_t *rw);
+void ff_rw_rlock(ff_rwlock_t *rw);
+int ff_rw_try_rlock(ff_rwlock_t *rw);
+int ff_rw_try_upgrade(ff_rwlock_t *rw);
+void ff_rw_downgrade(ff_rwlock_t *rw);
+int ff_rw_wowned(ff_rwlock_t *rw);
+int ff_rw_assert(ff_rwlock_t *rw, int what, const char *file, int line);
 
 #define rw_init(rw, n)          \
     rw_init_flags((rw), (n), 0)
 #define rw_init_flags(rw, n, o) \
     ff_rw_init_flags(&(rw)->lock_object, (n), (o))
-#define rw_destroy(rw) DO_NOTHING
-#define rw_wowned(rw) 1
-#define _rw_wlock(rw, f, l)    DO_NOTHING
-#define _rw_try_wlock(rw, f, l) 1
-#define _rw_wunlock(rw, f, l) DO_NOTHING
-#define _rw_rlock(rw, f, l)    DO_NOTHING
-#define _rw_try_rlock(rw, f, l) 1
-#define _rw_runlock(rw, f, l) DO_NOTHING
-#define _rw_try_upgrade(rw, f, l) 1
-#define _rw_downgrade(rw, f, l) DO_NOTHING
+#define rw_destroy(rw) ff_rw_destroy(&(rw)->lock_object)
+#define rw_wlock(rw) ff_rw_wlock(&(rw)->rw_lock)
+#define rw_try_wlock(rw) ff_rw_try_wlock(&(rw)->rw_lock)
+#define rw_wunlock(rw) ff_rw_wunlock(&(rw)->rw_lock)
+#define rw_rlock(rw) ff_rw_rlock(&(rw)->rw_lock)
+#define rw_try_rlock(rw) ff_rw_try_rlock(&(rw)->rw_lock)
+#define rw_runlock(rw) ff_rw_runlock(&(rw)->rw_lock)
+#define rw_try_upgrade(rw) ff_rw_try_upgrade(&(rw)->rw_lock)
+#define rw_downgrade(rw) ff_rw_downgrade(&(rw)->rw_lock)
+#define rw_wowned(rw) ff_rw_wowned(&(rw)->rw_lock)
+//#define rw_assert(m, w) ff_rw_assert(&(m)->rw_lock, (w), __FILE__, __LINE__)
 
 #endif    /* _FSTACK_SYS_RWLOCK_H_ */

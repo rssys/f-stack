@@ -42,8 +42,11 @@
 
 #undef UMA_MD_SMALL_ALLOC
 
-#define critical_enter() do {} while(0)
-#define critical_exit()  do {} while(0)
+void ff_uma_page_slab_hash_lock(void);
+void ff_uma_page_slab_hash_unlock(void);
+
+#define critical_enter()
+#define critical_exit()
 
 #define sleepq_lock(w) do {} while(0)
 #define sleepq_release(w) do {} while(0)
@@ -73,12 +76,17 @@ vtoslab(vm_offset_t va)
 {       
     struct uma_page_head *hash_list;
     uma_page_t up;
+    uma_slab_t slab = NULL;
 
     hash_list = &uma_page_slab_hash[UMA_PAGE_HASH(va)];
+    ff_uma_page_slab_hash_lock();
     LIST_FOREACH(up, hash_list, list_entry)
-        if (up->up_va == va)
-            return (up->up_slab);
-    return (NULL);
+        if (atop(up->up_va) == atop(va)) {
+            slab = up->up_slab;
+            break;
+        }
+    ff_uma_page_slab_hash_unlock();
+    return (slab);
 }
 
 static __inline void
@@ -88,12 +96,14 @@ vtozoneslab(vm_offset_t va, uma_zone_t *zone, uma_slab_t *slab)
     uma_page_t up;
 
     hash_list = &uma_page_slab_hash[UMA_PAGE_HASH(va)];
+    ff_uma_page_slab_hash_lock();
     LIST_FOREACH(up, hash_list, list_entry)
-        if (up->up_va == va)
+        if (atop(up->up_va) == atop(va))
             break;
 
     *slab = up->up_slab;
     *zone = up->up_zone;
+    ff_uma_page_slab_hash_unlock();
 }
 
 static __inline void
@@ -102,13 +112,15 @@ vsetzoneslab(vm_offset_t va, uma_zone_t zone, uma_slab_t slab)
     struct uma_page_head *hash_list;
     uma_page_t up;
     hash_list = &uma_page_slab_hash[UMA_PAGE_HASH(va)];
+    ff_uma_page_slab_hash_lock();
     LIST_FOREACH(up, hash_list, list_entry)
-        if (up->up_va == va)
+        if (atop(up->up_va) == atop(va))
             break;
 
     if (up != NULL) {
         up->up_slab = slab;
         up->up_zone = zone;
+        ff_uma_page_slab_hash_unlock();
         return;
     }
 
@@ -117,6 +129,7 @@ vsetzoneslab(vm_offset_t va, uma_zone_t zone, uma_slab_t slab)
     up->up_slab = slab;
     up->up_zone = zone;
     LIST_INSERT_HEAD(hash_list, up, list_entry);
+    ff_uma_page_slab_hash_unlock();
 }
 
 #endif    /* _FSTACK_VM_UMA_INT_H_ */

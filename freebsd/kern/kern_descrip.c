@@ -3859,7 +3859,7 @@ pwd_chdir(struct thread *td, struct vnode *vp)
 	struct pwddesc *pdp;
 	struct pwd *newpwd, *oldpwd;
 
-	VNPASS(vp->v_usecount > 0, vp);
+	//VNPASS(vp->v_usecount > 0, vp);
 
 	newpwd = pwd_alloc();
 	pdp = td->td_proc->p_pd;
@@ -5128,8 +5128,10 @@ ff_fdused_range(int max)
 {
 	int i, result;
 	struct thread *td = curthread;
+	sx_xlock(&td->td_proc->p_fd->fd_sx);
 	for (i = 0; i < max; i++)
 		fdalloc(td, 0, &result);
+	sx_xunlock(&td->td_proc->p_fd->fd_sx);
 }
 
 int

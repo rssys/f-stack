@@ -734,6 +734,53 @@ bad:
 }
 
 int
+ff_sendit_fp(struct thread *td, int s, struct file *fp, struct msghdr *mp, int flags)
+{
+	struct mbuf *control;
+	int error;
+
+#ifdef CAPABILITY_MODE
+	if (IN_CAPABILITY_MODE(td) && (mp->msg_name != NULL))
+		return (ECAPMODE);
+#endif
+
+	if (mp->msg_control) {
+		if (mp->msg_controllen < sizeof(struct cmsghdr)
+#ifdef COMPAT_OLDSOCK
+		    && (mp->msg_flags != MSG_COMPAT ||
+		    !SV_PROC_FLAG(td->td_proc, SV_AOUT))
+#endif
+		) {
+			error = EINVAL;
+			goto bad;
+		}
+		error = sockargs(&control, mp->msg_control,
+		    mp->msg_controllen, MT_CONTROL);
+		if (error != 0)
+			goto bad;
+#ifdef COMPAT_OLDSOCK
+		if (mp->msg_flags == MSG_COMPAT &&
+		    SV_PROC_FLAG(td->td_proc, SV_AOUT)) {
+			struct cmsghdr *cm;
+
+			M_PREPEND(control, sizeof(*cm), M_WAITOK);
+			cm = mtod(control, struct cmsghdr *);
+			cm->cmsg_len = control->m_len;
+			cm->cmsg_level = SOL_SOCKET;
+			cm->cmsg_type = SCM_RIGHTS;
+		}
+#endif
+	} else {
+		control = NULL;
+	}
+
+	error = ff_kern_sendit_fp(td, s, fp, mp, flags, control, UIO_USERSPACE);
+
+bad:
+	return (error);
+}
+
+int
 kern_sendit(struct thread *td, int s, struct msghdr *mp, int flags,
     struct mbuf *control, enum uio_seg segflg)
 {
@@ -824,6 +871,86 @@ kern_sendit(struct thread *td, int s, struct msghdr *mp, int flags,
 #endif
 bad:
 	fdrop(fp, td);
+	return (error);
+}
+
+int
+ff_kern_sendit_fp(struct thread *td, int s, struct file *fp, struct msghdr *mp, int flags,
+    struct mbuf *control, enum uio_seg segflg)
+{
+	struct uio auio;
+	struct iovec *iov;
+	struct socket *so;
+#ifdef KTRACE
+	struct uio *ktruio = NULL;
+#endif
+	ssize_t len;
+	int i, error;
+
+	so = (struct socket *)fp->f_data;
+
+#ifdef KTRACE
+	if (mp->msg_name != NULL && KTRPOINT(td, KTR_STRUCT))
+		ktrsockaddr(mp->msg_name);
+#endif
+#ifdef MAC
+	if (mp->msg_name != NULL) {
+		error = mac_socket_check_connect(td->td_ucred, so,
+		    mp->msg_name);
+		if (error != 0) {
+			m_freem(control);
+			goto bad;
+		}
+	}
+	error = mac_socket_check_send(td->td_ucred, so);
+	if (error != 0) {
+		m_freem(control);
+		goto bad;
+	}
+#endif
+
+	auio.uio_iov = mp->msg_iov;
+	auio.uio_iovcnt = mp->msg_iovlen;
+	auio.uio_segflg = segflg;
+	auio.uio_rw = UIO_WRITE;
+	auio.uio_td = td;
+	auio.uio_offset = 0;			/* XXX */
+	auio.uio_resid = 0;
+	iov = mp->msg_iov;
+	for (i = 0; i < mp->msg_iovlen; i++, iov++) {
+		if ((auio.uio_resid += iov->iov_len) < 0) {
+			error = EINVAL;
+			m_freem(control);
+			goto bad;
+		}
+	}
+#ifdef KTRACE
+	if (KTRPOINT(td, KTR_GENIO))
+		ktruio = cloneuio(&auio);
+#endif
+	len = auio.uio_resid;
+	error = sosend(so, mp->msg_name, &auio, 0, control, flags, td);
+	if (error != 0) {
+		if (auio.uio_resid != len && (error == ERESTART ||
+		    error == EINTR || error == EWOULDBLOCK))
+			error = 0;
+		/* Generation of SIGPIPE can be controlled per socket */
+		if (error == EPIPE && !(so->so_options & SO_NOSIGPIPE) &&
+		    !(flags & MSG_NOSIGNAL)) {
+			PROC_LOCK(td->td_proc);
+			tdsignal(td, SIGPIPE);
+			PROC_UNLOCK(td->td_proc);
+		}
+	}
+	if (error == 0)
+		td->td_retval[0] = len - auio.uio_resid;
+#ifdef KTRACE
+	if (ktruio != NULL) {
+		ktruio->uio_resid = td->td_retval[0];
+		ktrgenio(s, UIO_WRITE, ktruio, error);
+	}
+#endif
+bad:
 	return (error);
 }
 
@@ -1047,6 +1174,152 @@ kern_recvit(struct thread *td, int s, struct msghdr *mp, enum uio_seg fromseg,
 	}
 out:
 	fdrop(fp, td);
+#ifdef KTRACE
+	if (fromsa && KTRPOINT(td, KTR_STRUCT))
+		ktrsockaddr(fromsa);
+#endif
+	free(fromsa, M_SONAME);
+
+	if (error == 0 && controlp != NULL)
+		*controlp = control;
+	else if (control != NULL) {
+		if (error != 0)
+			m_dispose_extcontrolm(control);
+		m_freem(control);
+	}
+
+	return (error);
+}
+
+int
+ff_kern_recvit_fp(struct thread *td, int s, struct file *fp, struct msghdr *mp, enum uio_seg fromseg,
+    struct mbuf **controlp)
+{
+	struct uio auio;
+	struct iovec *iov;
+	struct mbuf *control, *m;
+	caddr_t ctlbuf;
+	struct socket *so;
+	struct sockaddr *fromsa = NULL;
+#ifdef KTRACE
+	struct uio *ktruio = NULL;
+#endif
+	ssize_t len;
+	int error, i;
+
+	if (controlp != NULL)
+		*controlp = NULL;
+
+	so = fp->f_data;
+
+#ifdef MAC
+	error = mac_socket_check_receive(td->td_ucred, so);
+	if (error != 0) {
+		return (error);
+	}
+#endif
+
+	auio.uio_iov = mp->msg_iov;
+	auio.uio_iovcnt = mp->msg_iovlen;
+	auio.uio_segflg = UIO_USERSPACE;
+	auio.uio_rw = UIO_READ;
+	auio.uio_td = td;
+	auio.uio_offset = 0;			/* XXX */
+	auio.uio_resid = 0;
+	iov = mp->msg_iov;
+	for (i = 0; i < mp->msg_iovlen; i++, iov++) {
+		if ((auio.uio_resid += iov->iov_len) < 0) {
+			return (EINVAL);
+		}
+	}
+#ifdef KTRACE
+	if (KTRPOINT(td, KTR_GENIO))
+		ktruio = cloneuio(&auio);
+#endif
+	control = NULL;
+	len = auio.uio_resid;
+	error = soreceive(so, &fromsa, &auio, NULL,
+	    (mp->msg_control || controlp) ? &control : NULL,
+	    &mp->msg_flags);
+	if (error != 0) {
+		if (auio.uio_resid != len && (error == ERESTART ||
+		    error == EINTR || error == EWOULDBLOCK))
+			error = 0;
+	}
+	if (fromsa != NULL)
+		AUDIT_ARG_SOCKADDR(td, AT_FDCWD, fromsa);
+#ifdef KTRACE
+	if (ktruio != NULL) {
+		ktruio->uio_resid = len - auio.uio_resid;
+		ktrgenio(s, UIO_READ, ktruio, error);
+	}
+#endif
+	if (error != 0)
+		goto out;
+	td->td_retval[0] = len - auio.uio_resid;
+	if (mp->msg_name) {
+		len = mp->msg_namelen;
+		if (len <= 0 || fromsa == NULL)
+			len = 0;
+		else {
+			/* save sa_len before it is destroyed by MSG_COMPAT */
+			len = MIN(len, fromsa->sa_len);
+#ifdef COMPAT_OLDSOCK
+			if ((mp->msg_flags & MSG_COMPAT) != 0 &&
+			    SV_PROC_FLAG(td->td_proc, SV_AOUT))
+				((struct osockaddr *)fromsa)->sa_family =
+				    fromsa->sa_family;
+#endif
+			if (fromseg == UIO_USERSPACE) {
+				error = copyout(fromsa, mp->msg_name,
+				    (unsigned)len);
+				if (error != 0)
+					goto out;
+			} else
+				bcopy(fromsa, mp->msg_name, len);
+		}
+		mp->msg_namelen = len;
+	}
+	if (mp->msg_control && controlp == NULL) {
+#ifdef COMPAT_OLDSOCK
+		/*
+		 * We assume that old recvmsg calls won't receive access
+		 * rights and other control info, esp. as control info
+		 * is always optional and those options didn't exist in 4.3.
+		 * If we receive rights, trim the cmsghdr; anything else
+		 * is tossed.
+		 */
+		if (control && (mp->msg_flags & MSG_COMPAT) != 0 &&
+		    SV_PROC_FLAG(td->td_proc, SV_AOUT)) {
+			if (mtod(control, struct cmsghdr *)->cmsg_level !=
+			    SOL_SOCKET ||
+			    mtod(control, struct cmsghdr *)->cmsg_type !=
+			    SCM_RIGHTS) {
+				mp->msg_controllen = 0;
+				goto out;
+			}
+			control->m_len -= sizeof (struct cmsghdr);
+			control->m_data += sizeof (struct cmsghdr);
+		}
+#endif
+		ctlbuf = mp->msg_control;
+		len = mp->msg_controllen;
+		mp->msg_controllen = 0;
+		for (m = control; m != NULL && len >= m->m_len; m = m->m_next) {
+			if ((error = copyout(mtod(m, caddr_t), ctlbuf,
+			    m->m_len)) != 0)
+				goto out;
+
+			ctlbuf += m->m_len;
+			len -= m->m_len;
+			mp->msg_controllen += m->m_len;
+		}
+		if (m != NULL) {
+			mp->msg_flags |= MSG_CTRUNC;
+			m_dispose_extcontrolm(m);
+		}
+	}
+out:
 #ifdef KTRACE
 	if (fromsa && KTRPOINT(td, KTR_STRUCT))
 		ktrsockaddr(fromsa);

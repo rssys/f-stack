@@ -49,6 +49,7 @@
  *	- Investigate cache size adjustments
  */
 
+#undef INVARIANTS
 #include <sys/cdefs.h>
 __FBSDID("$FreeBSD$");
 

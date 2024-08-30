@@ -87,8 +87,20 @@ int
 _sleep(const void * _Nonnull chan, struct lock_object *lock, int priority,
     const char *wmesg, sbintime_t sbt, sbintime_t pr, int flags)
 {
-    //FIXME:we couldn't really sleep.
-    return (EPERM);
+    struct lock_class *class;
+    uintptr_t lock_state;
+
+    if (lock == NULL)
+        return 0;
+
+    class = LOCK_CLASS(lock);
+
+    if (lock != &Giant.lock_object) {
+		lock_state = class->lc_unlock(lock);
+        class->lc_lock(lock, lock_state);
+    }
+
+    return 0;
 }
 
 //FIXME.
@@ -96,6 +108,8 @@ int
 msleep_spin_sbt(const void * _Nonnull chan, struct mtx *mtx, const char *wmesg,
     sbintime_t sbt, sbintime_t pr, int flags)
 {
+    mtx_unlock(mtx);
+    mtx_lock(mtx);
     return (0);
 }
 

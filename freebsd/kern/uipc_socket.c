@@ -1526,6 +1526,156 @@ out:
 	return (error);
 }
 
+
+struct mbuf *
+m_ffsuiotombuf(struct ff_suio *uio, int len, int align, int flags);
+
+static int
+ff_sosend_fast_path(struct socket *so, struct ff_suio *uio, struct thread *td)
+{
+	long space;
+	ssize_t resid;
+	int clen = 0, error;
+	struct mbuf *top = NULL;
+	int atomic = sosendallatonce(so);
+	int pru_flag;
+
+	if (SOLISTENING(so))
+		return ENOTCONN;
+
+	resid = uio->uio_resid;
+	/*
+	 * In theory resid should be unsigned.  However, space must be
+	 * signed, as it might be less than 0 if we over-committed, and we
+	 * must use a signed comparison of space and resid.  On the other
+	 * hand, a negative resid causes us to loop sending 0-length
+	 * segments to the protocol.
+	 *
+	 * Also check to make sure that MSG_EOR isn't used on SOCK_STREAM
+	 * type sockets since that's an error.
+	 */
+	if (resid < 0) {
+		error = EINVAL;
+		goto out;
+	}
+
+	do {
+		SOCKBUF_LOCK(&so->so_snd);
+		if (so->so_snd.sb_state & SBS_CANTSENDMORE) {
+			SOCKBUF_UNLOCK(&so->so_snd);
+			error = EPIPE;
+			goto out;
+		}
+		if (so->so_error) {
+			error = so->so_error;
+			so->so_error = 0;
+			SOCKBUF_UNLOCK(&so->so_snd);
+			goto out;
+		}
+		if ((so->so_state & SS_ISCONNECTED) == 0) {
+			/*
+			 * `sendto' and `sendmsg' is allowed on a connection-
+			 * based socket if it supports implied connect.
+			 * Return ENOTCONN if not connected and no address is
+			 * supplied.
+			 */
+			if ((so->so_proto->pr_flags & PR_CONNREQUIRED) &&
+			    (so->so_proto->pr_flags & PR_IMPLOPCL) == 0) {
+				if ((so->so_state & SS_ISCONFIRMING) == 0 &&
+				    !(resid == 0 && clen != 0)) {
+					SOCKBUF_UNLOCK(&so->so_snd);
+					error = ENOTCONN;
+					goto out;
+				}
+			} else {
+				SOCKBUF_UNLOCK(&so->so_snd);
+				if (so->so_proto->pr_flags & PR_CONNREQUIRED)
+					error = ENOTCONN;
+				else
+					error = EDESTADDRREQ;
+				goto out;
+			}
+		}
+		space = sbspace(&so->so_snd);
+		if ((atomic && resid > so->so_snd.sb_hiwat) ||
+		    clen > so->so_snd.sb_hiwat) {
+			SOCKBUF_UNLOCK(&so->so_snd);
+			error = EMSGSIZE;
+			goto out;
+		}
+		if (space < resid + clen &&
+		    (atomic || space < so->so_snd.sb_lowat || space < clen)) {
+			SOCKBUF_UNLOCK(&so->so_snd);
+			error = EWOULDBLOCK;
+			goto out;
+		}
+		SOCKBUF_UNLOCK(&so->so_snd);
+		space -= clen;
+		do {
+			/*
+			 * Copy the data from userland into a mbuf
+			 * chain.  If resid is 0, which can happen
+			 * only if we have control to send, then
+			 * a single empty mbuf is returned.  This
+			 * is a workaround to prevent protocol send
+			 * methods to panic.
+			 */
+			top = m_ffsuiotombuf(uio, space,
+			    (atomic ? max_hdr : 0),
+			    (atomic ? M_PKTHDR : 0));
+			if (top == NULL) {
+				error = EFAULT; /* only possible error */
+				goto out;
+			}
+			space -= resid - uio->uio_resid;
+			resid = uio->uio_resid;
+			/*
+			 * XXX all the SBS_CANTSENDMORE checks previously
+			 * done could be out of date.  We could have received
+			 * a reset packet in an interrupt or maybe we slept
+			 * while doing page faults in uiomove() etc.  We
+			 * could probably recheck again inside the locking
+			 * protection here, but there are probably other
+			 * places that this also happens.  We must rethink
+			 * this.
+			 */
+			VNET_SO_ASSERT(so);
+
+			pru_flag = 0;
+
+			error = (*so->so_proto->pr_usrreqs->pru_send)(so,
+			    pru_flag, top, NULL, NULL, td);
+
+			clen = 0;
+			top = NULL;
+			if (error)
+				goto out;
+		} while (resid && space > 0);
+	} while (resid);
+
+out:
+	if (top != NULL)
+		m_freem(top);
+	return (error);
+}
+
+int
+ff_kern_write_fast_path(struct thread *td, struct file *fp, struct ff_suio *auio)
+{
+	ssize_t cnt;
+	int error;
+
+	cnt = auio->uio_resid;
+	if ((error = ff_sosend_fast_path((struct socket *)fp->f_data, auio, td))) {
+		if (auio->uio_resid != cnt && (error == ERESTART ||
+		    error == EINTR || error == EWOULDBLOCK))
+			error = 0;
+	}
+	cnt -= auio->uio_resid;
+	td->td_retval[0] = cnt;
+	return (error);
+}
+
 /*
  * Send on a socket.  If send must go all at once and message is larger than
  * send buffering, then hard error.  Lock against other senders.  If must go
@@ -1886,6 +2036,357 @@ sockbuf_pushsync(struct sockbuf *sb, struct mbuf *nextrecord)
 		sb->sb_lastrecord = NULL;
 	} else if (sb->sb_mb->m_nextpkt == NULL)
 		sb->sb_lastrecord = sb->sb_mb;
+}
+
+int
+ff_soreceive_fast_path(struct socket *so, struct ff_suio *uio)
+{
+	struct mbuf *m;
+	int flags = 0, error, offset;
+	ssize_t len;
+	struct protosw *pr = so->so_proto;
+	struct mbuf *nextrecord;
+	int moff, type = 0;
+	ssize_t orig_resid = uio->uio_resid;
+
+	if ((pr->pr_flags & PR_WANTRCVD) && (so->so_state & SS_ISCONFIRMING)
+	    && uio->uio_resid) {
+		VNET_SO_ASSERT(so);
+		(*pr->pr_usrreqs->pru_rcvd)(so, 0);
+	}
+
+restart:
+	SOCKBUF_LOCK(&so->so_rcv);
+	m = so->so_rcv.sb_mb;
+	/*
+	 * If we have less data than requested, block awaiting more (subject
+	 * to any timeout) if:
+	 *   1. the current count is less than the low water mark, or
+	 *   2. MSG_DONTWAIT is not set
+	 */
+	if (m == NULL || (((flags & MSG_DONTWAIT) == 0 &&
+	    sbavail(&so->so_rcv) < uio->uio_resid) &&
+	    sbavail(&so->so_rcv) < so->so_rcv.sb_lowat &&
+	    m->m_nextpkt == NULL && (pr->pr_flags & PR_ATOMIC) == 0)) {
+		KASSERT(m != NULL || !sbavail(&so->so_rcv),
+		    ("receive: m == %p sbavail == %u",
+		    m, sbavail(&so->so_rcv)));
+		if (so->so_error) {
+			if (m != NULL)
+				goto dontblock;
+			error = so->so_error;
+			SOCKBUF_UNLOCK(&so->so_rcv);
+			goto release;
+		}
+		SOCKBUF_LOCK_ASSERT(&so->so_rcv);
+		if (so->so_rcv.sb_state & SBS_CANTRCVMORE) {
+			if (m != NULL)
+				goto dontblock;
+			else {
+				SOCKBUF_UNLOCK(&so->so_rcv);
+				goto release;
+			}
+		}
+		for (; m != NULL; m = m->m_next)
+			if (m->m_type == MT_OOBDATA  || (m->m_flags & M_EOR)) {
+				m = so->so_rcv.sb_mb;
+				goto dontblock;
+			}
+		if ((so->so_state & (SS_ISCONNECTING | SS_ISCONNECTED |
+		    SS_ISDISCONNECTING | SS_ISDISCONNECTED)) == 0 &&
+		    (so->so_proto->pr_flags & PR_CONNREQUIRED) != 0) {
+			SOCKBUF_UNLOCK(&so->so_rcv);
+			error = ENOTCONN;
+			goto release;
+		}
+		if (uio->uio_resid == 0) {
+			SOCKBUF_UNLOCK(&so->so_rcv);
+			goto release;
+		}
+		if ((so->so_state & SS_NBIO) ||
+		    (flags & (MSG_DONTWAIT|MSG_NBIO))) {
+			SOCKBUF_UNLOCK(&so->so_rcv);
+			error = EWOULDBLOCK;
+			goto release;
+		}
+		SBLASTRECORDCHK(&so->so_rcv);
+		SBLASTMBUFCHK(&so->so_rcv);
+		error = sbwait(&so->so_rcv);
+		SOCKBUF_UNLOCK(&so->so_rcv);
+		if (error)
+			goto release;
+		goto restart;
+	}
+dontblock:
+	/*
+	 * From this point onward, we maintain 'nextrecord' as a cache of the
+	 * pointer to the next record in the socket buffer.  We must keep the
+	 * various socket buffer pointers and local stack versions of the
+	 * pointers in sync, pushing out modifications before dropping the
+	 * socket buffer mutex, and re-reading them when picking it up.
+	 *
+	 * Otherwise, we will race with the network stack appending new data
+	 * or records onto the socket buffer by using inconsistent/stale
+	 * versions of the field, possibly resulting in socket buffer
+	 * corruption.
+	 *
+	 * By holding the high-level sblock(), we prevent simultaneous
+	 * readers from pulling off the front of the socket buffer.
+	 */
+	SOCKBUF_LOCK_ASSERT(&so->so_rcv);
+	KASSERT(m == so->so_rcv.sb_mb, ("soreceive: m != so->so_rcv.sb_mb"));
+	SBLASTRECORDCHK(&so->so_rcv);
+	SBLASTMBUFCHK(&so->so_rcv);
+	nextrecord = m->m_nextpkt;
+	if (pr->pr_flags & PR_ADDR) {
+		KASSERT(m->m_type == MT_SONAME,
+		    ("m->m_type == %d", m->m_type));
+		orig_resid = 0;
+		sbfree(&so->so_rcv, m);
+		so->so_rcv.sb_mb = m_free(m);
+		m = so->so_rcv.sb_mb;
+		sockbuf_pushsync(&so->so_rcv, nextrecord);
+	}
+
+	/*
+	 * Process one or more MT_CONTROL mbufs present before any data mbufs
+	 * in the first mbuf chain on the socket buffer.  If MSG_PEEK, we
+	 * just copy the data; if !MSG_PEEK, we call into the protocol to
+	 * perform externalization (or freeing if controlp == NULL).
+	 */
+	if (m != NULL && m->m_type == MT_CONTROL) {
+		struct mbuf *cm = NULL, *cmn;
+		struct mbuf **cme = &cm;
+
+		do {
+			sbfree(&so->so_rcv, m);
+			so->so_rcv.sb_mb = m->m_next;
+			m->m_next = NULL;
+			*cme = m;
+			cme = &(*cme)->m_next;
+			m = so->so_rcv.sb_mb;
+		} while (m != NULL && m->m_type == MT_CONTROL);
+		sockbuf_pushsync(&so->so_rcv, nextrecord);
+		while (cm != NULL) {
+			cmn = cm->m_next;
+			cm->m_next = NULL;
+			if (pr->pr_domain->dom_externalize != NULL) {
+				SOCKBUF_UNLOCK(&so->so_rcv);
+				VNET_SO_ASSERT(so);
+				error = (*pr->pr_domain->dom_externalize)
+				    (cm, NULL, flags);
+				SOCKBUF_LOCK(&so->so_rcv);
+			} else
+				m_freem(cm);
+			cm = cmn;
+		}
+		if (m != NULL)
+			nextrecord = so->so_rcv.sb_mb->m_nextpkt;
+		else
+			nextrecord = so->so_rcv.sb_mb;
+		orig_resid = 0;
+	}
+	if (m != NULL) {
+		type = m->m_type;
+		if (type == MT_OOBDATA)
+			flags |= MSG_OOB;
+	}
+	SOCKBUF_LOCK_ASSERT(&so->so_rcv);
+	SBLASTRECORDCHK(&so->so_rcv);
+	SBLASTMBUFCHK(&so->so_rcv);
+
+	/*
+	 * Now continue to read any data mbufs off of the head of the socket
+	 * buffer until the read request is satisfied.  Note that 'type' is
+	 * used to store the type of any mbuf reads that have happened so far
+	 * such that soreceive() can stop reading if the type changes, which
+	 * causes soreceive() to return only one of regular data and inline
+	 * out-of-band data in a single socket receive operation.
+	 */
+	moff = 0;
+	offset = 0;
+	while (m != NULL && !(m->m_flags & M_NOTAVAIL) && uio->uio_resid > 0
+	    && error == 0) {
+		/*
+		 * If the type of mbuf has changed since the last mbuf
+		 * examined ('type'), end the receive operation.
+		 */
+		SOCKBUF_LOCK_ASSERT(&so->so_rcv);
+		if (m->m_type == MT_OOBDATA || m->m_type == MT_CONTROL) {
+			if (type != m->m_type)
+				break;
+		} else if (type == MT_OOBDATA)
+			break;
+		so->so_rcv.sb_state &= ~SBS_RCVATMARK;
+		len = uio->uio_resid;
+		if (so->so_oobmark && len > so->so_oobmark - offset)
+			len = so->so_oobmark - offset;
+		if (len > m->m_len - moff)
+			len = m->m_len - moff;
+
+		SOCKBUF_LOCK_ASSERT(&so->so_rcv);
+		SBLASTRECORDCHK(&so->so_rcv);
+		SBLASTMBUFCHK(&so->so_rcv);
+		SOCKBUF_UNLOCK(&so->so_rcv);
+		error = ff_suiomoveout(mtod(m, char *) + moff,
+			(int)len, uio);
+		SOCKBUF_LOCK(&so->so_rcv);
+		if (error) {
+			/*
+			 * The MT_SONAME mbuf has already been removed
+			 * from the record, so it is necessary to
+			 * remove the data mbufs, if any, to preserve
+			 * the invariant in the case of PR_ADDR that
+			 * requires MT_SONAME mbufs at the head of
+			 * each record.
+			 */
+			if (pr->pr_flags & PR_ATOMIC &&
+			    ((flags & MSG_PEEK) == 0))
+				(void)sbdroprecord_locked(&so->so_rcv);
+			SOCKBUF_UNLOCK(&so->so_rcv);
+			goto release;
+		}
+
+		SOCKBUF_LOCK_ASSERT(&so->so_rcv);
+		if (len == m->m_len - moff) {
+			if (m->m_flags & M_EOR)
+				flags |= MSG_EOR;
+			nextrecord = m->m_nextpkt;
+			sbfree(&so->so_rcv, m);
+			so->so_rcv.sb_mb = m_free(m);
+			m = so->so_rcv.sb_mb;
+			sockbuf_pushsync(&so->so_rcv, nextrecord);
+			SBLASTRECORDCHK(&so->so_rcv);
+			SBLASTMBUFCHK(&so->so_rcv);
+		} else {
+			sbcut_locked(&so->so_rcv, len);
+		}
+		SOCKBUF_LOCK_ASSERT(&so->so_rcv);
+		if (so->so_oobmark) {
+			if ((flags & MSG_PEEK) == 0) {
+				so->so_oobmark -= len;
+				if (so->so_oobmark == 0) {
+					so->so_rcv.sb_state |= SBS_RCVATMARK;
+					break;
+				}
+			} else {
+				offset += len;
+				if (offset == so->so_oobmark)
+					break;
+			}
+		}
+		if (flags & MSG_EOR)
+			break;
+		/*
+		 * If the MSG_WAITALL flag is set (for non-atomic socket), we
+		 * must not quit until "uio->uio_resid == 0" or an error
+		 * termination.  If a signal/timeout occurs, return with a
+		 * short count but without error.  Keep sockbuf locked
+		 * against other readers.
+		 */
+		while (flags & MSG_WAITALL && m == NULL && uio->uio_resid > 0 &&
+		    !sosendallatonce(so) && nextrecord == NULL) {
+			SOCKBUF_LOCK_ASSERT(&so->so_rcv);
+			if (so->so_error ||
+			    so->so_rcv.sb_state & SBS_CANTRCVMORE)
+				break;
+			/*
+			 * Notify the protocol that some data has been
+			 * drained before blocking.
+			 */
+			if (pr->pr_flags & PR_WANTRCVD) {
+				SOCKBUF_UNLOCK(&so->so_rcv);
+				VNET_SO_ASSERT(so);
+				(*pr->pr_usrreqs->pru_rcvd)(so, flags);
+				SOCKBUF_LOCK(&so->so_rcv);
+			}
+			SBLASTRECORDCHK(&so->so_rcv);
+			SBLASTMBUFCHK(&so->so_rcv);
+			/*
+			 * We could receive some data while was notifying
+			 * the protocol. Skip blocking in this case.
+			 */
+			if (so->so_rcv.sb_mb == NULL) {
+				error = sbwait(&so->so_rcv);
+				if (error) {
+					SOCKBUF_UNLOCK(&so->so_rcv);
+					goto release;
+				}
+			}
+			m = so->so_rcv.sb_mb;
+			if (m != NULL)
+				nextrecord = m->m_nextpkt;
+		}
+	}
+
+	SOCKBUF_LOCK_ASSERT(&so->so_rcv);
+	if (m != NULL && pr->pr_flags & PR_ATOMIC) {
+		flags |= MSG_TRUNC;
+		if ((flags & MSG_PEEK) == 0)
+			(void) sbdroprecord_locked(&so->so_rcv);
+	}
+
+	if (m == NULL) {
+		/*
+		 * First part is an inline SB_EMPTY_FIXUP().  Second
+		 * part makes sure sb_lastrecord is up-to-date if
+		 * there is still data in the socket buffer.
+		 */
+		so->so_rcv.sb_mb = nextrecord;
+		if (so->so_rcv.sb_mb == NULL) {
+			so->so_rcv.sb_mbtail = NULL;
+			so->so_rcv.sb_lastrecord = NULL;
+		} else if (nextrecord->m_nextpkt == NULL)
+			so->so_rcv.sb_lastrecord = nextrecord;
+	}
+	SBLASTRECORDCHK(&so->so_rcv);
+	SBLASTMBUFCHK(&so->so_rcv);
+	/*
+	 * If soreceive() is being done from the socket callback,
+	 * then don't need to generate ACK to peer to update window,
+	 * since ACK will be generated on return to TCP.
+	 */
+	if (!(flags & MSG_SOCALLBCK) &&
+	    (pr->pr_flags & PR_WANTRCVD)) {
+		SOCKBUF_UNLOCK(&so->so_rcv);
+		VNET_SO_ASSERT(so);
+		(*pr->pr_usrreqs->pru_rcvd)(so, flags);
+		SOCKBUF_LOCK(&so->so_rcv);
+	}
+
+	SOCKBUF_LOCK_ASSERT(&so->so_rcv);
+	if (orig_resid == uio->uio_resid && orig_resid &&
+	    (flags & MSG_EOR) == 0 && (so->so_rcv.sb_state & SBS_CANTRCVMORE) == 0) {
+		SOCKBUF_UNLOCK(&so->so_rcv);
+		goto restart;
+	}
+	SOCKBUF_UNLOCK(&so->so_rcv);
+
+release:
+	return (error);
+}
+
+int
+ff_kern_read_fast_path(struct thread *td, struct file *fp, struct ff_suio *auio)
+{
+	ssize_t cnt;
+	int error;
+
+	/* Finish zero length reads right here */
+	if (auio->uio_resid == 0) {
+		td->td_retval[0] = 0;
+		return (0);
+	}
+
+	cnt = auio->uio_resid;
+	if ((error = ff_soreceive_fast_path((struct socket *)fp->f_data, auio))) {
+		if (auio->uio_resid != cnt && (error == ERESTART ||
+		    error == EINTR || error == EWOULDBLOCK))
+			error = 0;
+	}
+	cnt -= auio->uio_resid;
+	td->td_retval[0] = cnt;
+	return (error);
 }
 
 /*
@@ -4414,4 +4915,49 @@ so_unlock(struct socket *so)
 {
 
 	SOCK_UNLOCK(so);
+}
+
+int
+ff_sopoll(struct socket *so, int events, struct ucred *active_cred,
+    struct thread *td)
+{
+	int revents;
+
+	SOCK_LOCK(so);
+	if (SOLISTENING(so)) {
+		if (!(events & (POLLIN | POLLRDNORM)))
+			revents = 0;
+		else if (!TAILQ_EMPTY(&so->sol_comp))
+			revents = events & (POLLIN | POLLRDNORM);
+		else if ((events & POLLINIGNEOF) == 0 && so->so_error)
+			revents = (events & (POLLIN | POLLRDNORM)) | POLLHUP;
+		else {
+			revents = 0;
+		}
+	} else {
+		revents = 0;
+		SOCKBUF_LOCK(&so->so_snd);
+		SOCKBUF_LOCK(&so->so_rcv);
+		if (events & (POLLIN | POLLRDNORM))
+			if (soreadabledata(so))
+				revents |= events & (POLLIN | POLLRDNORM);
+		if (events & (POLLOUT | POLLWRNORM))
+			if (sowriteable(so))
+				revents |= events & (POLLOUT | POLLWRNORM);
+		if (events & (POLLPRI | POLLRDBAND))
+			if (so->so_oobmark ||
+			    (so->so_rcv.sb_state & SBS_RCVATMARK))
+				revents |= events & (POLLPRI | POLLRDBAND);
+		if ((events & POLLINIGNEOF) == 0) {
+			if (so->so_rcv.sb_state & SBS_CANTRCVMORE) {
+				revents |= events & (POLLIN | POLLRDNORM);
+				if (so->so_snd.sb_state & SBS_CANTSENDMORE)
+					revents |= POLLHUP;
+			}
+		}
+		SOCKBUF_UNLOCK(&so->so_rcv);
+		SOCKBUF_UNLOCK(&so->so_snd);
+	}
+	SOCK_UNLOCK(so);
+	return (revents);
 }
